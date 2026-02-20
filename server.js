@@ -137,7 +137,7 @@ function generateSlotRange(startTime, totalMinutes) {
 }
 
 const app = express();
-const port = process.env.PORT;
+
 
 // --- Add CORS allowlist & options (must run before routes) ---
 const allowedOrigins = process.env.NODE_ENV === 'production'
@@ -1482,5 +1482,16 @@ async function startServer() {
     process.exit(1);
   }
 }
+// ---- START SERVER (Render-compatible) ----
+const PORT = process.env.PORT || 3000;
 
-startServer();
+startServer()
+  .then(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
