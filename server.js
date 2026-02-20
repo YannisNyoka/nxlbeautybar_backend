@@ -1471,16 +1471,46 @@ async function startServer() {
       }
       res.status(500).json({ success: false, error: 'Internal server error' });
     });
+    // --- Initialize CRUD Routes ---
+    // This is the part that was missing. You must call the function for each collection.
+    crudRoutes('SERVICES', 'services');
+    crudRoutes('EMPLOYEES', 'employees');
+    crudRoutes('AVAILABILITY', 'availability');
+    crudRoutes('APPOINTMENTS', 'appointments');
+    crudRoutes('PAYMENTS', 'payments'); 
 
-    // --- Listen only if DB is connected ---
+    // --- Final Middleware & Error Handling ---
+
+    // 404 Handler: Catch-all for routes that don't exist
+    // This ensures you get a JSON error instead of an HTML page
+    app.use((req, res) => {
+      res.status(404).json({ 
+        success: false, 
+        error: `Route ${req.originalUrl} not found.` 
+      });
+    });
+
+    // Global Error Handler
+    app.use((err, req, res, next) => {
+      logger.error(err.stack);
+      res.status(err.status || 500).json({ 
+        success: false, 
+        error: err.message || 'Internal Server Error' 
+      });
+    });
+
     app.listen(port, () => {
-      logger.info(`Server is running on http://localhost:${port}`);
+      console.log(`Server is running on port: ${port}`);
     });
 
   } catch (err) {
-    console.error('Failed to connect to MongoDB', err);
+    console.error('Failed to start server:', err);
     process.exit(1);
   }
 }
 
+// Don't forget to actually run the function!
 startServer();
+
+    // --- Listen only if DB is connected ---
+   
