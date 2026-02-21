@@ -1054,6 +1054,7 @@ async function startServer() {
       );
 
       // Update by ID
+      // FIX: findOneAndUpdate in MongoDB driver v5+ returns the document directly, not { value: doc }
       app.put(
         `/${route}/:id`,
         authenticateToken,
@@ -1111,9 +1112,6 @@ async function startServer() {
             const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
             if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
-            // REMOVED: Ownership check - all users can now update any appointment (based on business rules)
-            // Only admins should be able to modify appointments in production, but removing filter as requested
-
             // Status transitions
             const validTransitions = {
               booked: ['cancelled', 'completed'],
@@ -1153,13 +1151,14 @@ async function startServer() {
           }
 
           try {
-            const result = await db.collection(collectionName).findOneAndUpdate(
+            // FIX: MongoDB driver v5+ returns the document directly (not wrapped in { value: doc })
+            const updatedDoc = await db.collection(collectionName).findOneAndUpdate(
               { _id: new ObjectId(req.params.id) },
               { $set: req.body },
               { returnDocument: 'after' }
             );
-            if (!result.value) return res.status(404).json({ success: false, error: 'Document not found' });
-            res.status(200).json({ success: true, message: 'Updated', data: result.value });
+            if (!updatedDoc) return res.status(404).json({ success: false, error: 'Document not found' });
+            res.status(200).json({ success: true, message: 'Updated', data: updatedDoc });
           } catch (err) {
             if (err.code === 121) {
               return res.status(400).json({ success: false, error: 'Schema validation failed', details: err.errInfo });
@@ -1236,8 +1235,6 @@ async function startServer() {
             if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
             
             if (collectionName === 'APPOINTMENTS') {
-              // REMOVED: Ownership check - all users can view any appointment
-
               // Populate related documents
               const user = await db.collection('USERS').findOne({ _id: doc.userId }, { projection: { password: 0 } });
               const employee = await db.collection('EMPLOYEES').findOne({ _id: doc.employeeId });
@@ -1314,7 +1311,7 @@ async function startServer() {
       );
     }
 
-    // Register CRUD routes for each collection
+    // Register CRUD routes for each collection (ONCE only)
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
     crudRoutes('EMPLOYEES', 'employees');
@@ -1360,13 +1357,14 @@ async function startServer() {
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
           delete req.body.password;
           req.body.updatedAt = new Date();
-          const result = await db.collection('USERS').findOneAndUpdate(
+          // FIX: MongoDB driver v5+ returns the document directly
+          const updatedUser = await db.collection('USERS').findOneAndUpdate(
             { _id: new ObjectId(req.params.id) },
             { $set: req.body },
             { returnDocument: 'after', projection: { password: 0 } }
           );
-          if (!result.value) return res.status(404).json({ success: false, error: 'User not found' });
-          res.status(200).json({ success: true, message: 'User updated', data: result.value });
+          if (!updatedUser) return res.status(404).json({ success: false, error: 'User not found' });
+          res.status(200).json({ success: true, message: 'User updated', data: updatedUser });
         } catch (err) { next(err); }
       }
     );
@@ -1450,6 +1448,14 @@ async function startServer() {
       uptime: process.uptime()
     }));
 
+    // 404 Handler: Catch-all for routes that don't exist
+    app.use((req, res) => {
+      res.status(404).json({ 
+        success: false, 
+        error: `Route ${req.originalUrl} not found.` 
+      });
+    });
+
     // --- Centralized error handler (log errors) ---
     app.use((err, req, res, next) => {
       if (err && err.message === 'Not allowed by CORS') {
@@ -1471,33 +1477,6 @@ async function startServer() {
       }
       res.status(500).json({ success: false, error: 'Internal server error' });
     });
-    // --- Initialize CRUD Routes ---
-    // This is the part that was missing. You must call the function for each collection.
-    crudRoutes('SERVICES', 'services');
-    crudRoutes('EMPLOYEES', 'employees');
-    crudRoutes('AVAILABILITY', 'availability');
-    crudRoutes('APPOINTMENTS', 'appointments');
-    crudRoutes('PAYMENTS', 'payments'); 
-
-    // --- Final Middleware & Error Handling ---
-
-    // 404 Handler: Catch-all for routes that don't exist
-    // This ensures you get a JSON error instead of an HTML page
-    app.use((req, res) => {
-      res.status(404).json({ 
-        success: false, 
-        error: `Route ${req.originalUrl} not found.` 
-      });
-    });
-
-    // Global Error Handler
-    app.use((err, req, res, next) => {
-      logger.error(err.stack);
-      res.status(err.status || 500).json({ 
-        success: false, 
-        error: err.message || 'Internal Server Error' 
-      });
-    });
 
     app.listen(port, () => {
       console.log(`Server is running on port: ${port}`);
@@ -1509,8 +1488,4 @@ async function startServer() {
   }
 }
 
-// Don't forget to actually run the function!
 startServer();
-
-    // --- Listen only if DB is connected ---
-   
