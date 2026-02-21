@@ -11,9 +11,9 @@ const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 const swaggerUi = require('swagger-ui-express');
 const winston = require('winston');
-const nodemailer = require('nodemailer'); // For email integration
+const nodemailer = require('nodemailer');
 
-// ---- Date/time normalization helpers (frontend may send "January 20 2026" + "09:00 am") ----
+// ---- Date/time normalization helpers ----
 function pad2(n) {
   return String(n).padStart(2, '0');
 }
@@ -43,10 +43,6 @@ function normalizeDateToISO(dateRaw) {
   const d = dateRaw.trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
 
-  // Explicitly support formats like:
-  // - "January 20 2026"
-  // - "January 2026 20"   (this is what your UI shows)
-  // - "Jan 20, 2026"
   {
     const m = d
       .replace(/,/g, ' ')
@@ -85,10 +81,6 @@ function normalizeDateToISO(dateRaw) {
         } else if (bIsYear && !aIsYear) {
           year = parseInt(b, 10);
           day = parseInt(a, 10);
-        } else if (aIsYear && bIsYear) {
-          // ambiguous, fall through to Date.parse below
-        } else {
-          // neither looks like a year; fall through to Date.parse below
         }
 
         if (year && day && day >= 1 && day <= 31) {
@@ -102,11 +94,9 @@ function normalizeDateToISO(dateRaw) {
     }
   }
 
-  // Fallback: Try Date.parse for other human-readable strings
   const parsed = new Date(d);
   if (Number.isNaN(parsed.getTime())) return null;
 
-  // Format as local YYYY-MM-DD to avoid UTC date shifts
   const yyyy = parsed.getFullYear();
   const mm = pad2(parsed.getMonth() + 1);
   const dd = pad2(parsed.getDate());
@@ -139,7 +129,7 @@ function generateSlotRange(startTime, totalMinutes) {
 const app = express();
 const port = process.env.PORT;
 
-// --- Add CORS allowlist & options (must run before routes) ---
+// --- CORS ---
 const allowedOrigins = process.env.NODE_ENV === 'production'
   ? [process.env.CORS_ORIGIN]
   : [/^http:\/\/localhost:\d+$/];
@@ -156,50 +146,35 @@ const corsOptions = {
   optionsSuccessStatus: 200
 };
 
-// --- Add this line to define refreshTokens ---
 const refreshTokens = new Set();
 
-// Winston logger setup
+// Winston logger
 const logger = winston.createLogger({
   level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.Console()
-  ]
+  format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
+  transports: [new winston.transports.Console()]
 });
 
 function sendValidationError(res, errors) {
   const list = Array.isArray(errors) ? errors : [];
   const msg = list.length
-    ? list
-        .map(e => {
-          const field = e?.path || e?.param || 'field';
-          const m = e?.msg || 'Invalid value';
-          return `${field}: ${m}`;
-        })
-        .join(', ')
+    ? list.map(e => `${e?.path || e?.param || 'field'}: ${e?.msg || 'Invalid value'}`).join(', ')
     : 'Validation failed';
-  // Include both `error` (for simpler frontends) and `errors` (for detailed UI handling)
   return res.status(400).json({ success: false, error: msg, errors: list });
 }
 
 function decimalToNumber(v) {
   if (v == null) return null;
   if (typeof v === 'number') return v;
-  // mongodb Decimal128
   if (typeof v === 'object' && typeof v.toString === 'function') {
-    const s = v.toString();
-    const n = Number(s);
+    const n = Number(v.toString());
     return Number.isFinite(n) ? n : null;
   }
   const n = Number(String(v));
   return Number.isFinite(n) ? n : null;
 }
 
-// Fail fast if required env vars are missing
+// Fail fast on missing env vars
 const requiredEnv = ['PORT', 'MONGODB_URI', 'DB_NAME', 'JWT_SECRET', 'CORS_ORIGIN'];
 const missingEnv = requiredEnv.filter(key => !process.env[key]);
 if (missingEnv.length > 0) {
@@ -207,47 +182,48 @@ if (missingEnv.length > 0) {
   process.exit(1);
 }
 
-// Security & logging middleware
+// --- Core middleware ---
 app.use(helmet());
-// FIX: Proper CORS before routes with preflight support
 app.use(cors(corsOptions));
-// Express 5 / path-to-regexp v6: wildcard strings like "*" or "/*" are invalid; use a regex catch-all
 app.options(/.*/, cors(corsOptions));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json());
 
-// FIX: Strip /api prefix early so routes match
-app.use('/api', (req, _res, next) => {
-  req.url = req.url.replace(/^\/api/, '');
+// ============================================================
+// FIX: Strip /api prefix so frontend calls to /api/payments
+// correctly match routes registered as /payments
+// ============================================================
+app.use((req, _res, next) => {
+  if (req.url.startsWith('/api/')) {
+    req.url = req.url.slice(4); // "/api/payments" -> "/payments"
+  } else if (req.url === '/api') {
+    req.url = '/';
+  }
   next();
 });
 
-// Rate limit auth routes
+// Rate limiter for auth routes
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { success: false, error: 'Too many requests, please try again later.' }
 });
 
-// Environment-based configuration
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.DB_NAME;
 const jwtSecret = process.env.JWT_SECRET;
 
 const client = new MongoClient(uri);
-
 let db;
 
 // Graceful shutdown
 function shutdown() {
-  client.close().then(() => {
-    process.exit(0);
-  });
+  client.close().then(() => process.exit(0));
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-// Production HTTPS redirect middleware
+// Production HTTPS redirect
 if (process.env.NODE_ENV === 'production') {
   app.use((req, res, next) => {
     if (req.headers['x-forwarded-proto'] !== 'https') {
@@ -257,7 +233,7 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-// Initialize all collections with validation and indexes
+// --- Collection initialization ---
 const initCollections = async (db) => {
   // USERS
   await db.createCollection('USERS', {
@@ -277,13 +253,9 @@ const initCollections = async (db) => {
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
-  try {
-    await db.collection('USERS').dropIndex('email_1');
-  } catch (e) {
-    // ignore if index doesn't exist
-  }
+  try { await db.collection('USERS').dropIndex('email_1'); } catch (e) {}
   await db.collection('USERS').createIndex({ email: 1 }, { unique: true, name: 'email_unique_idx' });
 
   // SERVICES
@@ -302,13 +274,9 @@ const initCollections = async (db) => {
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
-  try {
-    await db.collection('SERVICES').dropIndex('name_1');
-  } catch (e) {
-    // ignore if index doesn't exist
-  }
+  try { await db.collection('SERVICES').dropIndex('name_1'); } catch (e) {}
   await db.collection('SERVICES').createIndex({ name: 1 }, { unique: true, name: 'service_name_unique_idx' });
 
   // EMPLOYEES
@@ -327,13 +295,9 @@ const initCollections = async (db) => {
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
-  try {
-    await db.collection('EMPLOYEES').dropIndex('email_1');
-  } catch (e) {
-    // ignore if index doesn't exist
-  }
+  try { await db.collection('EMPLOYEES').dropIndex('email_1'); } catch (e) {}
   await db.collection('EMPLOYEES').createIndex({ email: 1 }, { unique: true, sparse: true, name: 'employee_email_unique_idx' });
 
   // AVAILABILITY
@@ -345,24 +309,15 @@ const initCollections = async (db) => {
         properties: {
           date: { bsonType: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
           time: { bsonType: 'string', pattern: '^\\d{2}:\\d{2}$' },
-          employeeId: {
-            anyOf: [
-              { bsonType: 'objectId' },
-              { bsonType: 'string', enum: ['ALL'] }
-            ]
-          },
+          employeeId: { anyOf: [{ bsonType: 'objectId' }, { bsonType: 'string', enum: ['ALL'] }] },
           reason: { bsonType: 'string' },
           createdAt: { bsonType: 'date' }
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
-  try {
-    await db.collection('AVAILABILITY').dropIndex('date_1_time_1_employeeId_1');
-  } catch (e) {
-    // ignore if index doesn't exist
-  }
+  try { await db.collection('AVAILABILITY').dropIndex('date_1_time_1_employeeId_1'); } catch (e) {}
   await db.collection('AVAILABILITY').createIndex(
     { date: 1, time: 1, employeeId: 1 },
     { unique: true, name: 'availability_unique_idx' }
@@ -373,10 +328,7 @@ const initCollections = async (db) => {
     validator: {
       $jsonSchema: {
         bsonType: 'object',
-        required: [
-          'date', 'time', 'userId', 'employeeId', 'serviceIds',
-          'totalPrice', 'status', 'createdAt', 'updatedAt'
-        ],
+        required: ['date', 'time', 'userId', 'employeeId', 'serviceIds', 'totalPrice', 'status', 'createdAt', 'updatedAt'],
         properties: {
           date: { bsonType: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
           time: { bsonType: 'string', pattern: '^\\d{2}:\\d{2}$' },
@@ -391,13 +343,9 @@ const initCollections = async (db) => {
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
-  try {
-    await db.collection('APPOINTMENTS').dropIndex('date_1_time_1_employeeId_1');
-  } catch (e) {
-    // ignore if index doesn't exist
-  }
+  try { await db.collection('APPOINTMENTS').dropIndex('date_1_time_1_employeeId_1'); } catch (e) {}
   await db.collection('APPOINTMENTS').createIndex(
     { date: 1, time: 1, employeeId: 1 },
     { unique: true, name: 'appointment_unique_idx' }
@@ -420,19 +368,10 @@ const initCollections = async (db) => {
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
-  try {
-    await db.collection('PAYMENTS').dropIndex('payment_appointment_unique_idx');
-  } catch (e) {
-    // ignore if index doesn't exist
-  }
-  try {
-    await db.collection('PAYMENTS').dropIndex('appointmentId_1');
-  } catch (e) {
-    // ignore if index doesn't exist
-  }
-  // Allow one deposit + one full payment per appointment
+  try { await db.collection('PAYMENTS').dropIndex('payment_appointment_unique_idx'); } catch (e) {}
+  try { await db.collection('PAYMENTS').dropIndex('appointmentId_1'); } catch (e) {}
   await db.collection('PAYMENTS').createIndex(
     { appointmentId: 1, type: 1 },
     { unique: true, name: 'payment_appointment_type_unique_idx' }
@@ -455,7 +394,7 @@ const initCollections = async (db) => {
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
   await db.collection('NOTIFICATIONS').createIndex({ createdAt: -1 });
 
@@ -475,11 +414,11 @@ const initCollections = async (db) => {
         }
       }
     },
-    validationLevel: "strict"
+    validationLevel: 'strict'
   }).catch(() => {});
 };
 
-// --- DB connection before routes ---
+// --- Start server ---
 async function startServer() {
   try {
     await client.connect();
@@ -487,9 +426,7 @@ async function startServer() {
     await initCollections(db);
     console.log('Connected to MongoDB Atlas');
 
-    // --- Register routes only after DB is ready ---
-
-    // Authentication middleware
+    // Auth middleware
     function authenticateToken(req, res, next) {
       const authHeader = req.headers['authorization'];
       const token = authHeader && authHeader.split(' ')[1];
@@ -510,10 +447,11 @@ async function startServer() {
       };
     }
 
-    // Input validation helpers
     const idValidator = param('id').isMongoId().withMessage('Invalid ID format');
 
-    // --- Auth routes ---
+    // =====================
+    // AUTH ROUTES
+    // =====================
     app.post('/auth/register', authLimiter,
       body('email').isEmail().normalizeEmail(),
       body('password').isString().isLength({ min: 8 }).matches(/[A-Z]/).matches(/[a-z]/).matches(/[0-9]/).matches(/[^A-Za-z0-9]/),
@@ -526,43 +464,22 @@ async function startServer() {
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
           const { email, password, firstName, lastName } = req.body;
 
-          // Enforce unique email
           const exists = await db.collection('USERS').findOne({ email });
           if (exists) return res.status(409).json({ success: false, error: 'Email already registered' });
 
-          // Hash password
           const hashedPassword = await bcrypt.hash(password, 10);
-
           const now = new Date();
-          const user = {
-            email,
-            password: hashedPassword,
-            firstName,
-            lastName,
-            role: 'user',
-            isActive: true,
-            createdAt: now,
-            updatedAt: now
-          };
-
+          const user = { email, password: hashedPassword, firstName, lastName, role: 'user', isActive: true, createdAt: now, updatedAt: now };
           const result = await db.collection('USERS').insertOne(user);
 
-          // Use the stored role from MongoDB for JWT/response
-          const token = jwt.sign(
-            { userId: result.insertedId, email: user.email, role: user.role },
-            jwtSecret,
-            { expiresIn: '1h' }
-          );
-
+          const token = jwt.sign({ userId: result.insertedId, email: user.email, role: user.role }, jwtSecret, { expiresIn: '1h' });
           res.status(201).json({
             success: true,
             message: 'User registered successfully',
             data: { _id: result.insertedId, email: user.email, firstName: user.firstName, lastName: user.lastName, role: user.role },
             token
           });
-        } catch (err) {
-          next(err);
-        }
+        } catch (err) { next(err); }
       }
     );
 
@@ -578,29 +495,16 @@ async function startServer() {
           const user = await db.collection('USERS').findOne({ email });
           if (!user) return res.status(400).json({ success: false, error: 'Invalid credentials' });
 
-          // Compare hashed password
           const match = await bcrypt.compare(password, user.password);
           if (!match) return res.status(400).json({ success: false, error: 'Invalid credentials' });
 
-          // Normalize role from DB; persist default if missing
           const normalizedRole = ['admin', 'user'].includes(user.role) ? user.role : 'user';
           if (normalizedRole !== user.role) {
-            await db.collection('USERS').updateOne(
-              { _id: user._id },
-              { $set: { role: normalizedRole, updatedAt: new Date() } }
-            );
+            await db.collection('USERS').updateOne({ _id: user._id }, { $set: { role: normalizedRole, updatedAt: new Date() } });
           }
 
-          const token = jwt.sign(
-            { userId: user._id, email: user.email, role: normalizedRole },
-            jwtSecret,
-            { expiresIn: '1h' }
-          );
-          const refreshToken = jwt.sign(
-            { userId: user._id, email: user.email, role: normalizedRole },
-            jwtSecret,
-            { expiresIn: '7d' }
-          );
+          const token = jwt.sign({ userId: user._id, email: user.email, role: normalizedRole }, jwtSecret, { expiresIn: '1h' });
+          const refreshToken = jwt.sign({ userId: user._id, email: user.email, role: normalizedRole }, jwtSecret, { expiresIn: '7d' });
           refreshTokens.add(refreshToken);
 
           res.status(200).json({
@@ -610,15 +514,11 @@ async function startServer() {
             token,
             refreshToken
           });
-        } catch (err) {
-          next(err);
-        }
+        } catch (err) { next(err); }
       }
     );
 
-    // --- Password reset/change endpoints ---
-    app.post('/auth/change-password',
-      authenticateToken,
+    app.post('/auth/change-password', authenticateToken,
       body('oldPassword').isString().notEmpty(),
       body('newPassword').isString().isLength({ min: 8 }).matches(/[A-Z]/).matches(/[a-z]/).matches(/[0-9]/).matches(/[^A-Za-z0-9]/),
       async (req, res, next) => {
@@ -630,51 +530,32 @@ async function startServer() {
           const match = await bcrypt.compare(req.body.oldPassword, user.password);
           if (!match) return res.status(400).json({ success: false, error: 'Old password incorrect' });
           const hashedPassword = await bcrypt.hash(req.body.newPassword, 10);
-          await db.collection('USERS').updateOne(
-            { _id: user._id },
-            { $set: { password: hashedPassword, updatedAt: new Date() } }
-          );
+          await db.collection('USERS').updateOne({ _id: user._id }, { $set: { password: hashedPassword, updatedAt: new Date() } });
           res.status(200).json({ success: true, message: 'Password changed successfully' });
         } catch (err) { next(err); }
       }
     );
 
-    // --- Password reset (with email integration stub) ---
-    app.post('/auth/request-password-reset',
-      authLimiter,
+    app.post('/auth/request-password-reset', authLimiter,
       body('email').isEmail().normalizeEmail(),
       async (req, res, next) => {
         try {
           const errors = validationResult(req);
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
           const user = await db.collection('USERS').findOne({ email: req.body.email });
-          if (!user) {
-            // Don't reveal if email exists
-            return res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
-          }
-          
-          // Generate reset token (valid for 1 hour)
-          const resetToken = jwt.sign(
-            { userId: user._id, email: user.email, type: 'password-reset' },
-            jwtSecret,
-            { expiresIn: '1h' }
-          );
+          if (!user) return res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
 
-          // Store token hash in DB (optional, for invalidation)
+          const resetToken = jwt.sign({ userId: user._id, email: user.email, type: 'password-reset' }, jwtSecret, { expiresIn: '1h' });
           await db.collection('USERS').updateOne(
             { _id: user._id },
             { $set: { passwordResetToken: resetToken, passwordResetExpiry: new Date(Date.now() + 3600000) } }
           );
 
-          // Email integration
           if (process.env.NODE_ENV === 'production' && process.env.SMTP_HOST) {
             const transporter = nodemailer.createTransport({
               host: process.env.SMTP_HOST,
               port: process.env.SMTP_PORT,
-              auth: {
-                user: process.env.SMTP_USER,
-                pass: process.env.SMTP_PASS
-              }
+              auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
             });
             const resetUrl = `${process.env.CORS_ORIGIN}/reset-password?token=${resetToken}`;
             await transporter.sendMail({
@@ -684,7 +565,6 @@ async function startServer() {
               html: `<p>Click <a href="${resetUrl}">here</a> to reset your password. This link expires in 1 hour.</p>`
             });
           } else {
-            // Development: log token
             logger.info(`Password reset token for ${req.body.email}: ${resetToken}`);
           }
 
@@ -693,9 +573,7 @@ async function startServer() {
       }
     );
 
-    // Reset password with token
-    app.post('/auth/reset-password',
-      authLimiter,
+    app.post('/auth/reset-password', authLimiter,
       body('token').isString().notEmpty(),
       body('newPassword').isString().isLength({ min: 8 }).matches(/[A-Z]/).matches(/[a-z]/).matches(/[0-9]/).matches(/[^A-Za-z0-9]/),
       async (req, res, next) => {
@@ -703,21 +581,16 @@ async function startServer() {
           const errors = validationResult(req);
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
 
-          // Verify token
           let decoded;
           try {
             decoded = jwt.verify(req.body.token, jwtSecret);
-            if (decoded.type !== 'password-reset') {
-              return res.status(400).json({ success: false, error: 'Invalid reset token' });
-            }
+            if (decoded.type !== 'password-reset') return res.status(400).json({ success: false, error: 'Invalid reset token' });
           } catch (err) {
             return res.status(400).json({ success: false, error: 'Invalid or expired reset token' });
           }
 
           const user = await db.collection('USERS').findOne({ _id: new ObjectId(decoded.userId) });
           if (!user) return res.status(404).json({ success: false, error: 'User not found' });
-
-          // Check if token matches stored token and hasn't expired
           if (user.passwordResetToken !== req.body.token || new Date() > new Date(user.passwordResetExpiry)) {
             return res.status(400).json({ success: false, error: 'Invalid or expired reset token' });
           }
@@ -725,18 +598,13 @@ async function startServer() {
           const hashedPassword = await bcrypt.hash(req.body.newPassword, 10);
           await db.collection('USERS').updateOne(
             { _id: user._id },
-            { 
-              $set: { password: hashedPassword, updatedAt: new Date() },
-              $unset: { passwordResetToken: '', passwordResetExpiry: '' }
-            }
+            { $set: { password: hashedPassword, updatedAt: new Date() }, $unset: { passwordResetToken: '', passwordResetExpiry: '' } }
           );
-
           res.status(200).json({ success: true, message: 'Password reset successfully' });
         } catch (err) { next(err); }
       }
     );
 
-    // --- Refresh token endpoints ---
     app.post('/auth/refresh-token',
       body('refreshToken').isString().notEmpty(),
       async (req, res, next) => {
@@ -745,22 +613,19 @@ async function startServer() {
           if (!refreshTokens.has(refreshToken)) return res.status(403).json({ success: false, error: 'Invalid refresh token' });
           jwt.verify(refreshToken, jwtSecret, (err, user) => {
             if (err) return res.status(403).json({ success: false, error: 'Invalid refresh token' });
-            const token = jwt.sign(
-              { userId: user.userId, email: user.email, role: user.role },
-              jwtSecret,
-              { expiresIn: '1h' }
-            );
+            const token = jwt.sign({ userId: user.userId, email: user.email, role: user.role }, jwtSecret, { expiresIn: '1h' });
             res.status(200).json({ success: true, token });
           });
         } catch (err) { next(err); }
       }
     );
 
-    // --- CRUD generator with per-collection validation ---
+    // =====================
+    // CRUD GENERATOR
+    // =====================
     function crudRoutes(collectionName, route) {
       console.log(`Registering routes for /${route}`);
 
-      // Per-collection validators
       let validators = [];
       if (collectionName === 'SERVICES') {
         validators = [
@@ -786,7 +651,6 @@ async function startServer() {
         ];
       } else if (collectionName === 'APPOINTMENTS') {
         validators = [
-          // Accept ISO "YYYY-MM-DD"/"HH:MM" OR normalize common human-readable strings from the UI
           body('date').custom((v, { req }) => {
             const normalized = normalizeAppointmentDateTime(v, req.body?.time);
             if (!normalized) return false;
@@ -815,7 +679,6 @@ async function startServer() {
         ];
       }
 
-      // Optional validators for PUT (partial updates)
       const putValidators =
         collectionName === 'SERVICES' ? [
           body('name').optional().isString().notEmpty(),
@@ -859,488 +722,337 @@ async function startServer() {
           body('status').optional().isIn(['pending', 'paid', 'refunded'])
         ] : [];
 
-      // Create
-      app.post(
-        `/${route}`,
-        authenticateToken,
-        ...validators,
-        async (req, res, next) => {
-          if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
-          const errors = validationResult(req);
-          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+      // --- CREATE ---
+      app.post(`/${route}`, authenticateToken, ...validators, async (req, res, next) => {
+        if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) return sendValidationError(res, errors.array());
 
-          // Block manual _id injection
-          if (req.body._id) return res.status(400).json({ success: false, error: 'Manual _id injection is not allowed' });
+        if (req.body._id) return res.status(400).json({ success: false, error: 'Manual _id injection is not allowed' });
 
-          // Remove unsafe fields
-          delete req.body.createdAt;
-          delete req.body.updatedAt;
-          if (collectionName === 'USERS') delete req.body.role;
+        delete req.body.createdAt;
+        delete req.body.updatedAt;
+        if (collectionName === 'USERS') delete req.body.role;
 
-          // Set timestamps
-          req.body.createdAt = new Date();
-          req.body.updatedAt = new Date();
+        req.body.createdAt = new Date();
+        req.body.updatedAt = new Date();
 
-          // FIX: Convert all incoming IDs to ObjectId
-          if (req.body.employeeId && typeof req.body.employeeId === 'string' && req.body.employeeId !== 'ALL') {
-            req.body.employeeId = new ObjectId(req.body.employeeId);
+        if (req.body.employeeId && typeof req.body.employeeId === 'string' && req.body.employeeId !== 'ALL') {
+          req.body.employeeId = new ObjectId(req.body.employeeId);
+        }
+        if (Array.isArray(req.body.serviceIds)) {
+          req.body.serviceIds = req.body.serviceIds.map(id => new ObjectId(id));
+        }
+        if (Array.isArray(req.body.servicesOffered)) {
+          req.body.servicesOffered = req.body.servicesOffered.map(id => new ObjectId(id));
+        }
+        if (req.body.appointmentId && typeof req.body.appointmentId === 'string') {
+          req.body.appointmentId = new ObjectId(req.body.appointmentId);
+        }
+
+        if (collectionName === 'SERVICES' && req.body.price) {
+          req.body.price = Decimal128.fromString(String(req.body.price));
+        }
+        if (collectionName === 'PAYMENTS' && req.body.amount) {
+          req.body.amount = Decimal128.fromString(String(req.body.amount));
+        }
+
+        if (collectionName === 'EMPLOYEES') {
+          const serviceIds = req.body.servicesOffered || [];
+          const count = await db.collection('SERVICES').countDocuments({ _id: { $in: serviceIds }, isActive: true });
+          if (count !== serviceIds.length) {
+            return res.status(400).json({ success: false, error: 'All referenced services must exist and be active' });
           }
-          if (Array.isArray(req.body.serviceIds)) {
-            req.body.serviceIds = req.body.serviceIds.map(id => new ObjectId(id));
-          }
-          if (Array.isArray(req.body.servicesOffered)) {
-            req.body.servicesOffered = req.body.servicesOffered.map(id => new ObjectId(id));
-          }
-          if (req.body.appointmentId && typeof req.body.appointmentId === 'string') {
-            req.body.appointmentId = new ObjectId(req.body.appointmentId);
+        }
+
+        if (collectionName === 'APPOINTMENTS') {
+          const emp = await db.collection('EMPLOYEES').findOne({ _id: req.body.employeeId, isActive: true });
+          if (!emp) return res.status(400).json({ success: false, error: 'Employee not found or inactive' });
+
+          const serviceIds = req.body.serviceIds || [];
+          const count = await db.collection('SERVICES').countDocuments({ _id: { $in: serviceIds }, isActive: true });
+          if (count !== serviceIds.length) {
+            return res.status(400).json({ success: false, error: 'All services must exist and be active' });
           }
 
-          // Convert price/amount to Decimal128
-          if (collectionName === 'SERVICES' && req.body.price) {
-            req.body.price = Decimal128.fromString(String(req.body.price));
-          }
-          if (collectionName === 'PAYMENTS' && req.body.amount) {
-            req.body.amount = Decimal128.fromString(String(req.body.amount));
-          }
+          const services = await db.collection('SERVICES').find({ _id: { $in: req.body.serviceIds } }).toArray();
+          const totalDuration = services.reduce((sum, s) => sum + s.durationMinutes, 0);
+          const requestedSlots = generateSlotRange(req.body.time, totalDuration);
 
-          // EMPLOYEES: validate referenced serviceIds exist and are active (not soft-deleted)
-          if (collectionName === 'EMPLOYEES') {
-            const serviceIds = req.body.servicesOffered || [];
-            const count = await db.collection('SERVICES').countDocuments({ _id: { $in: serviceIds }, isActive: true });
-            if (count !== serviceIds.length) {
-              return res.status(400).json({ success: false, error: 'All referenced services must exist and be active' });
+          const overlapping = await db.collection('APPOINTMENTS').findOne({
+            date: req.body.date,
+            employeeId: req.body.employeeId,
+            time: { $in: requestedSlots }
+          });
+          if (overlapping) return res.status(400).json({ success: false, error: 'This appointment overlaps with an existing booking' });
+
+          const blocked = await db.collection('AVAILABILITY').findOne({
+            date: req.body.date,
+            time: { $in: requestedSlots },
+            $or: [{ employeeId: req.body.employeeId }, { employeeId: 'ALL' }]
+          });
+          if (blocked) return res.status(400).json({ success: false, error: 'One or more time slots are unavailable' });
+
+          const totalPrice = services.reduce((sum, s) => sum + parseFloat(s.price), 0);
+          req.body.totalPrice = Decimal128.fromString(totalPrice.toFixed(2));
+          req.body.status = 'booked';
+          if (req.user?.userId) req.body.userId = new ObjectId(req.user.userId);
+          req.body.paymentStatus = 'unpaid';
+        }
+
+        if (collectionName === 'PAYMENTS') {
+          const appt = await db.collection('APPOINTMENTS').findOne({ _id: req.body.appointmentId });
+          if (!appt) return res.status(400).json({ success: false, error: 'Appointment does not exist' });
+
+          const paymentType = req.body.type || 'full';
+          const depositAmount = decimalToNumber(process.env.DEPOSIT_AMOUNT ?? 100);
+          const paidAmount = decimalToNumber(req.body.amount);
+          const total = decimalToNumber(appt.totalPrice);
+          if (paidAmount == null || total == null) return res.status(400).json({ success: false, error: 'Invalid payment amount' });
+
+          if (paymentType === 'deposit') {
+            if (depositAmount == null || paidAmount !== depositAmount) {
+              return res.status(400).json({ success: false, error: `Deposit must be ${depositAmount?.toFixed?.(2) ?? depositAmount}` });
             }
+            if (paidAmount > total) return res.status(400).json({ success: false, error: 'Deposit cannot exceed appointment totalPrice' });
+            req.body.type = 'deposit';
+          } else {
+            if (paidAmount !== total) return res.status(400).json({ success: false, error: 'Payment amount must match appointment totalPrice' });
+            req.body.type = 'full';
           }
 
-          // APPOINTMENTS: enforce business rules
-          if (collectionName === 'APPOINTMENTS') {
-            // Check employee is active (not soft-deleted)
-            const emp = await db.collection('EMPLOYEES').findOne({ _id: req.body.employeeId, isActive: true });
-            if (!emp) return res.status(400).json({ success: false, error: 'Employee not found or inactive' });
+          const exists = await db.collection('PAYMENTS').findOne({ appointmentId: req.body.appointmentId, type: req.body.type });
+          if (exists) return res.status(400).json({ success: false, error: 'Payment already exists for this appointment' });
+          if (!['pending', 'paid'].includes(req.body.status)) return res.status(400).json({ success: false, error: 'Invalid payment status' });
+        }
 
-            // Check all services exist and are active (not soft-deleted)
-            const serviceIds = req.body.serviceIds || [];
-            const count = await db.collection('SERVICES').countDocuments({ _id: { $in: serviceIds }, isActive: true });
-            if (count !== serviceIds.length) {
+        try {
+          const result = await db.collection(collectionName).insertOne(req.body);
+          if (!result.insertedId) return res.status(500).json({ success: false, error: 'Failed to create document' });
+
+          if (collectionName === 'PAYMENTS') {
+            const nextStatus = req.body.type === 'deposit' ? 'deposit_paid' : 'paid';
+            await db.collection('APPOINTMENTS').updateOne(
+              { _id: req.body.appointmentId },
+              { $set: { paymentStatus: nextStatus, updatedAt: new Date() } }
+            );
+          }
+          res.status(201).json({ success: true, message: 'Created', data: { _id: result.insertedId, ...req.body } });
+        } catch (err) {
+          if (err.code === 121) return res.status(400).json({ success: false, error: 'Schema validation failed', details: err.errInfo });
+          if (err.code === 11000) return res.status(409).json({ success: false, error: 'Duplicate key error' });
+          next(err);
+        }
+      });
+
+      // --- UPDATE ---
+      app.put(`/${route}/:id`, authenticateToken, idValidator, ...putValidators, async (req, res, next) => {
+        if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+
+        if (req.body._id) return res.status(400).json({ success: false, error: 'Manual _id injection is not allowed' });
+
+        delete req.body.createdAt;
+        delete req.body.updatedAt;
+        if (collectionName === 'USERS') delete req.body.role;
+        req.body.updatedAt = new Date();
+
+        if (req.body.employeeId && typeof req.body.employeeId === 'string' && req.body.employeeId !== 'ALL') {
+          req.body.employeeId = new ObjectId(req.body.employeeId);
+        }
+        if (Array.isArray(req.body.serviceIds)) {
+          req.body.serviceIds = req.body.serviceIds.map(id => new ObjectId(id));
+        }
+        if (Array.isArray(req.body.servicesOffered)) {
+          req.body.servicesOffered = req.body.servicesOffered.map(id => new ObjectId(id));
+        }
+        if (req.body.appointmentId && typeof req.body.appointmentId === 'string') {
+          req.body.appointmentId = new ObjectId(req.body.appointmentId);
+        }
+
+        if (collectionName === 'SERVICES' && req.body.price) {
+          req.body.price = Decimal128.fromString(String(req.body.price));
+        }
+        if (collectionName === 'PAYMENTS' && req.body.amount) {
+          req.body.amount = Decimal128.fromString(String(req.body.amount));
+        }
+
+        if (collectionName === 'EMPLOYEES' && req.body.servicesOffered) {
+          const count = await db.collection('SERVICES').countDocuments({ _id: { $in: req.body.servicesOffered }, isActive: true });
+          if (count !== req.body.servicesOffered.length) {
+            return res.status(400).json({ success: false, error: 'All referenced services must exist and be active' });
+          }
+        }
+
+        if (collectionName === 'APPOINTMENTS') {
+          const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
+          if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
+
+          const validTransitions = { booked: ['cancelled', 'completed'], cancelled: [], completed: [] };
+          if (req.body.status && !validTransitions[appt.status].includes(req.body.status)) {
+            return res.status(400).json({ success: false, error: 'Invalid status transition' });
+          }
+
+          if (req.body.serviceIds) {
+            const count = await db.collection('SERVICES').countDocuments({ _id: { $in: req.body.serviceIds }, isActive: true });
+            if (count !== req.body.serviceIds.length) {
               return res.status(400).json({ success: false, error: 'All services must exist and be active' });
             }
-
-            // Calculate total duration and check for overlapping appointments
-            const services = await db.collection('SERVICES')
-              .find({ _id: { $in: req.body.serviceIds } })
-              .toArray();
-
-            const totalDuration = services.reduce(
-              (sum, s) => sum + s.durationMinutes,
-              0
+            const services = await db.collection('SERVICES').find({ _id: { $in: req.body.serviceIds } }).toArray();
+            req.body.totalPrice = Decimal128.fromString(
+              services.reduce((sum, s) => sum + parseFloat(s.price), 0).toFixed(2)
             );
-
-            const requestedSlots = generateSlotRange(req.body.time, totalDuration);
-
-            // Check overlap with existing appointments
-            const overlapping = await db.collection('APPOINTMENTS').findOne({
-              date: req.body.date,
-              employeeId: req.body.employeeId,
-              time: { $in: requestedSlots }
-            });
-
-            if (overlapping) {
-              return res.status(400).json({
-                success: false,
-                error: 'This appointment overlaps with an existing booking'
-              });
-            }
-
-            // FIX: Enforce AVAILABILITY with range-aware check
-            const blocked = await db.collection('AVAILABILITY').findOne({
-              date: req.body.date,
-              time: { $in: requestedSlots },
-              $or: [
-                { employeeId: req.body.employeeId },
-                { employeeId: 'ALL' }
-              ]
-            });
-
-            if (blocked) {
-              return res.status(400).json({
-                success: false,
-                error: 'One or more time slots are unavailable'
-              });
-            }
-
-            // Calculate totalPrice from SERVICES (Decimal128)
-            const totalPrice = services.reduce((sum, s) => sum + parseFloat(s.price), 0);
-            req.body.totalPrice = Decimal128.fromString(totalPrice.toFixed(2));
-            req.body.status = 'booked';
-            // FIX: ensure userId is stored as ObjectId (req.user.userId is a string from JWT)
-            if (req.user?.userId) {
-              req.body.userId = new ObjectId(req.user.userId);
-            }
-            // Track payment status for UI / downstream logic
-            req.body.paymentStatus = 'unpaid';
-          }
-
-          // PAYMENTS: enforce business rules
-          if (collectionName === 'PAYMENTS') {
-            // Validate appointment exists
-            const appt = await db.collection('APPOINTMENTS').findOne({ _id: req.body.appointmentId });
-            if (!appt) return res.status(400).json({ success: false, error: 'Appointment does not exist' });
-
-            // Support deposits/partial payments
-            const paymentType = req.body.type || 'full';
-            const depositAmount = decimalToNumber(process.env.DEPOSIT_AMOUNT ?? 100);
-            const paidAmount = decimalToNumber(req.body.amount);
-            const total = decimalToNumber(appt.totalPrice);
-            if (paidAmount == null || total == null) {
-              return res.status(400).json({ success: false, error: 'Invalid payment amount' });
-            }
-
-            if (paymentType === 'deposit') {
-              // Deposit policy: exact deposit amount (default R100). Override via DEPOSIT_AMOUNT env.
-              if (depositAmount == null || paidAmount !== depositAmount) {
-                return res.status(400).json({ success: false, error: `Deposit must be ${depositAmount?.toFixed?.(2) ?? depositAmount}` });
-              }
-              if (paidAmount > total) {
-                return res.status(400).json({ success: false, error: 'Deposit cannot exceed appointment totalPrice' });
-              }
-              req.body.type = 'deposit';
-            } else {
-              // Full payment must match appointment totalPrice
-              if (paidAmount !== total) {
-                return res.status(400).json({ success: false, error: 'Payment amount must match appointment totalPrice' });
-              }
-              req.body.type = 'full';
-            }
-
-            // Prevent duplicate payment
-            const exists = await db.collection('PAYMENTS').findOne({ appointmentId: req.body.appointmentId, type: req.body.type });
-            if (exists) return res.status(400).json({ success: false, error: 'Payment already exists for this appointment' });
-            // Only allow status 'pending' or 'paid' on create
-            if (!['pending', 'paid'].includes(req.body.status)) {
-              return res.status(400).json({ success: false, error: 'Invalid payment status' });
-            }
-          }
-
-          // Business logic: prevent duplicate _id
-          if (req.body._id) {
-            const exists = await db.collection(collectionName).findOne({ _id: req.body._id });
-            if (exists) return res.status(400).json({ success: false, error: 'Document with this _id already exists' });
-          }
-          try {
-            const result = await db.collection(collectionName).insertOne(req.body);
-            if (!result.insertedId) {
-              return res.status(500).json({ success: false, error: 'Failed to create document' });
-            }
-
-            // Post-create side effects
-            if (collectionName === 'PAYMENTS') {
-              const nextStatus = req.body.type === 'deposit' ? 'deposit_paid' : 'paid';
-              await db.collection('APPOINTMENTS').updateOne(
-                { _id: req.body.appointmentId },
-                { $set: { paymentStatus: nextStatus, updatedAt: new Date() } }
-              );
-            }
-            res.status(201).json({ success: true, message: 'Created', data: { _id: result.insertedId, ...req.body } });
-          } catch (err) {
-            if (err.code === 121) {
-              return res.status(400).json({ success: false, error: 'Schema validation failed', details: err.errInfo });
-            }
-            if (err.code === 11000) {
-              return res.status(409).json({ success: false, error: 'Duplicate key error' });
-            }
-            next(err);
           }
         }
-      );
 
-      // Update by ID
-      // FIX: findOneAndUpdate in MongoDB driver v5+ returns the document directly, not { value: doc }
-      app.put(
-        `/${route}/:id`,
-        authenticateToken,
-        idValidator,
-        ...putValidators,
-        async (req, res, next) => {
-          if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
-          const errors = validationResult(req);
-          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
-
-          // Block manual _id injection
-          if (req.body._id) return res.status(400).json({ success: false, error: 'Manual _id injection is not allowed' });
-
-          // Remove unsafe fields
-          delete req.body.createdAt;
-          delete req.body.updatedAt;
-          if (collectionName === 'USERS') delete req.body.role;
-
-          // Set updatedAt
-          req.body.updatedAt = new Date();
-
-          // FIX: Convert all incoming IDs to ObjectId
-          if (req.body.employeeId && typeof req.body.employeeId === 'string' && req.body.employeeId !== 'ALL') {
-            req.body.employeeId = new ObjectId(req.body.employeeId);
+        if (collectionName === 'PAYMENTS') {
+          const payment = await db.collection('PAYMENTS').findOne({ _id: new ObjectId(req.params.id) });
+          if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
+          const validTransitions = { pending: ['paid', 'refunded'], paid: ['refunded'], refunded: [] };
+          if (req.body.status && !validTransitions[payment.status].includes(req.body.status)) {
+            return res.status(400).json({ success: false, error: 'Invalid payment status transition' });
           }
-          if (Array.isArray(req.body.serviceIds)) {
-            req.body.serviceIds = req.body.serviceIds.map(id => new ObjectId(id));
-          }
-          if (Array.isArray(req.body.servicesOffered)) {
-            req.body.servicesOffered = req.body.servicesOffered.map(id => new ObjectId(id));
-          }
-          if (req.body.appointmentId && typeof req.body.appointmentId === 'string') {
-            req.body.appointmentId = new ObjectId(req.body.appointmentId);
-          }
+        }
 
-          // Convert price/amount to Decimal128
-          if (collectionName === 'SERVICES' && req.body.price) {
-            req.body.price = Decimal128.fromString(String(req.body.price));
-          }
-          if (collectionName === 'PAYMENTS' && req.body.amount) {
-            req.body.amount = Decimal128.fromString(String(req.body.amount));
-          }
+        try {
+          // FIX: MongoDB driver v5+ returns the document directly, not { value: doc }
+          const updatedDoc = await db.collection(collectionName).findOneAndUpdate(
+            { _id: new ObjectId(req.params.id) },
+            { $set: req.body },
+            { returnDocument: 'after' }
+          );
+          if (!updatedDoc) return res.status(404).json({ success: false, error: 'Document not found' });
+          res.status(200).json({ success: true, message: 'Updated', data: updatedDoc });
+        } catch (err) {
+          if (err.code === 121) return res.status(400).json({ success: false, error: 'Schema validation failed', details: err.errInfo });
+          if (err.code === 11000) return res.status(409).json({ success: false, error: 'Duplicate key error' });
+          next(err);
+        }
+      });
 
-          // EMPLOYEES: validate referenced serviceIds exist and are active (not soft-deleted)
-          if (collectionName === 'EMPLOYEES' && req.body.servicesOffered) {
-            const serviceIds = req.body.servicesOffered;
-            const count = await db.collection('SERVICES').countDocuments({ _id: { $in: serviceIds }, isActive: true });
-            if (count !== serviceIds.length) {
-              return res.status(400).json({ success: false, error: 'All referenced services must exist and be active' });
-            }
-          }
+      // --- READ ALL ---
+      app.get(`/${route}`, authenticateToken, async (req, res, next) => {
+        if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
+        try {
+          let docs = await db.collection(collectionName).find({}).limit(500).toArray();
 
-          // APPOINTMENTS: enforce valid status transitions, recalc totalPrice if services change
           if (collectionName === 'APPOINTMENTS') {
-            const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
-            if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
+            const userIds = [...new Set(docs.map(d => d.userId))];
+            const employeeIds = [...new Set(docs.map(d => d.employeeId))];
+            const serviceIds = [...new Set(docs.flatMap(d => d.serviceIds))];
 
-            // Status transitions
-            const validTransitions = {
-              booked: ['cancelled', 'completed'],
-              cancelled: [],
-              completed: []
-            };
-            if (req.body.status && !validTransitions[appt.status].includes(req.body.status)) {
-              return res.status(400).json({ success: false, error: 'Invalid status transition' });
-            }
+            const users = await db.collection('USERS').find({ _id: { $in: userIds } }).project({ password: 0 }).toArray();
+            const employees = await db.collection('EMPLOYEES').find({ _id: { $in: employeeIds } }).toArray();
+            const services = await db.collection('SERVICES').find({ _id: { $in: serviceIds } }).toArray();
 
-            // If services changed, recalc totalPrice
-            if (req.body.serviceIds) {
-              const serviceIds = req.body.serviceIds;
-              const count = await db.collection('SERVICES').countDocuments({ _id: { $in: serviceIds }, isActive: true });
-              if (count !== serviceIds.length) {
-                return res.status(400).json({ success: false, error: 'All services must exist and be active' });
-              }
-              const services = await db.collection('SERVICES').find({ _id: { $in: serviceIds } }).toArray();
-              req.body.totalPrice = Decimal128.fromString(
-                services.reduce((sum, s) => sum + parseFloat(s.price), 0).toFixed(2)
-              );
-            }
+            const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+            const empMap = Object.fromEntries(employees.map(e => [e._id.toString(), e]));
+            const svcMap = Object.fromEntries(services.map(s => [s._id.toString(), s]));
+
+            docs = docs.map(doc => ({
+              ...doc,
+              userName: userMap[doc.userId.toString()]?.firstName + ' ' + userMap[doc.userId.toString()]?.lastName,
+              user: userMap[doc.userId.toString()],
+              employee: empMap[doc.employeeId.toString()],
+              services: doc.serviceIds.map(id => svcMap[id.toString()]).filter(Boolean),
+              totalDuration: doc.totalDuration || doc.serviceIds.reduce((sum, id) => {
+                const svc = svcMap[id.toString()];
+                return sum + (svc?.durationMinutes || 0);
+              }, 0)
+            }));
           }
 
-          // PAYMENTS: enforce valid state transitions
-          if (collectionName === 'PAYMENTS') {
-            const payment = await db.collection('PAYMENTS').findOne({ _id: new ObjectId(req.params.id) });
-            if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
-            const validTransitions = {
-              pending: ['paid', 'refunded'],
-              paid: ['refunded'],
-              refunded: []
-            };
-            if (req.body.status && !validTransitions[payment.status].includes(req.body.status)) {
-              return res.status(400).json({ success: false, error: 'Invalid payment status transition' });
-            }
+          res.status(200).json({ success: true, data: docs });
+        } catch (err) { next(err); }
+      });
+
+      // --- READ BY ID ---
+      app.get(`/${route}/:id`, authenticateToken, idValidator, async (req, res, next) => {
+        if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+        try {
+          let doc = await db.collection(collectionName).findOne({ _id: new ObjectId(req.params.id) });
+          if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
+
+          if (collectionName === 'APPOINTMENTS') {
+            const user = await db.collection('USERS').findOne({ _id: doc.userId }, { projection: { password: 0 } });
+            const employee = await db.collection('EMPLOYEES').findOne({ _id: doc.employeeId });
+            const services = await db.collection('SERVICES').find({ _id: { $in: doc.serviceIds } }).toArray();
+            doc = { ...doc, user, employee, services };
           }
 
-          try {
-            // FIX: MongoDB driver v5+ returns the document directly (not wrapped in { value: doc })
-            const updatedDoc = await db.collection(collectionName).findOneAndUpdate(
-              { _id: new ObjectId(req.params.id) },
-              { $set: req.body },
-              { returnDocument: 'after' }
-            );
-            if (!updatedDoc) return res.status(404).json({ success: false, error: 'Document not found' });
-            res.status(200).json({ success: true, message: 'Updated', data: updatedDoc });
-          } catch (err) {
-            if (err.code === 121) {
-              return res.status(400).json({ success: false, error: 'Schema validation failed', details: err.errInfo });
-            }
-            if (err.code === 11000) {
-              return res.status(409).json({ success: false, error: 'Duplicate key error' });
-            }
-            next(err);
-          }
+          res.status(200).json({ success: true, data: doc });
+        } catch (err) { next(err); }
+      });
+
+      // --- DELETE ---
+      app.delete(`/${route}/:id`, authenticateToken, authorizeRole('admin'), idValidator, async (req, res, next) => {
+        if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+
+        if (collectionName === 'EMPLOYEES') {
+          const future = await db.collection('APPOINTMENTS').findOne({
+            employeeId: new ObjectId(req.params.id),
+            date: { $gte: new Date().toISOString().slice(0, 10) }
+          });
+          if (future) return res.status(400).json({ success: false, error: 'Cannot delete employee with future appointments' });
+          const result = await db.collection(collectionName).updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { isActive: false, updatedAt: new Date() } }
+          );
+          if (result.matchedCount === 0) return res.status(404).json({ success: false, error: 'Document not found' });
+          return res.status(200).json({ success: true, message: 'Soft deleted successfully' });
         }
-      );
 
-      // Read all - NO FILTERING: All users see all appointments
-      app.get(
-        `/${route}`,
-        authenticateToken,
-        async (req, res, next) => {
-          if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
-          try {
-            // NO FILTERING - All users see all records
-            let query = {};
-            
-            let docs = await db.collection(collectionName).find(query).limit(500).toArray();
-
-            // Populate user and employee for appointments
-            if (collectionName === 'APPOINTMENTS') {
-              const userIds = [...new Set(docs.map(d => d.userId))];
-              const employeeIds = [...new Set(docs.map(d => d.employeeId))];
-              const serviceIds = [...new Set(docs.flatMap(d => d.serviceIds))];
-
-              const users = await db.collection('USERS')
-                .find({ _id: { $in: userIds } })
-                .project({ password: 0 })
-                .toArray();
-              const employees = await db.collection('EMPLOYEES').find({ _id: { $in: employeeIds } }).toArray();
-              const services = await db.collection('SERVICES').find({ _id: { $in: serviceIds } }).toArray();
-
-              const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
-              const empMap = Object.fromEntries(employees.map(e => [e._id.toString(), e]));
-              const svcMap = Object.fromEntries(services.map(s => [s._id.toString(), s]));
-
-              docs = docs.map(doc => ({
-                ...doc,
-                userName: userMap[doc.userId.toString()]?.firstName + ' ' + userMap[doc.userId.toString()]?.lastName,
-                user: userMap[doc.userId.toString()],
-                employee: empMap[doc.employeeId.toString()],
-                services: doc.serviceIds.map(id => svcMap[id.toString()]).filter(Boolean),
-                // Calculate totalDuration if not stored
-                totalDuration: doc.totalDuration || doc.serviceIds.reduce((sum, id) => {
-                  const service = svcMap[id.toString()];
-                  return sum + (service?.durationMinutes || 0);
-                }, 0)
-              }));
-            }
-
-            res.status(200).json({ success: true, data: docs });
-          } catch (err) {
-            next(err);
-          }
+        if (collectionName === 'SERVICES') {
+          const future = await db.collection('APPOINTMENTS').findOne({
+            serviceIds: new ObjectId(req.params.id),
+            date: { $gte: new Date().toISOString().slice(0, 10) }
+          });
+          if (future) return res.status(400).json({ success: false, error: 'Cannot delete service linked to future appointments' });
+          const result = await db.collection(collectionName).updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { isActive: false, updatedAt: new Date() } }
+          );
+          if (result.matchedCount === 0) return res.status(404).json({ success: false, error: 'Document not found' });
+          return res.status(200).json({ success: true, message: 'Soft deleted successfully' });
         }
-      );
 
-      // Read by ID - NO FILTERING: All users can view any appointment
-      app.get(
-        `/${route}/:id`,
-        authenticateToken,
-        idValidator,
-        async (req, res, next) => {
-          if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
-          const errors = validationResult(req);
-          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
-          try {
-            let doc = await db.collection(collectionName).findOne({ _id: new ObjectId(req.params.id) });
-            if (!doc) return res.status(404).json({ success: false, error: 'Document not found' });
-            
-            if (collectionName === 'APPOINTMENTS') {
-              // Populate related documents
-              const user = await db.collection('USERS').findOne({ _id: doc.userId }, { projection: { password: 0 } });
-              const employee = await db.collection('EMPLOYEES').findOne({ _id: doc.employeeId });
-              const services = await db.collection('SERVICES').find({ _id: { $in: doc.serviceIds } }).toArray();
-
-              doc = {
-                ...doc,
-                user,
-                employee,
-                services
-              };
-            }
-
-            res.status(200).json({ success: true, data: doc });
-          } catch (err) {
-            next(err);
-          }
-        }
-      );
-
-      // Delete by ID (EMPLOYEES/SERVICES: prevent deletion if linked to future appointments)
-      app.delete(
-        `/${route}/:id`,
-        authenticateToken,
-        authorizeRole('admin'),
-        idValidator,
-        async (req, res, next) => {
-          if (!db) return res.status(500).json({ success: false, error: 'Database not connected' });
-          const errors = validationResult(req);
-          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
-
-          // EMPLOYEES: prevent deletion if linked to future appointments
-          if (collectionName === 'EMPLOYEES') {
-            const future = await db.collection('APPOINTMENTS').findOne({
-              employeeId: new ObjectId(req.params.id),
-              date: { $gte: new Date().toISOString().slice(0, 10) }
-            });
-            if (future) return res.status(400).json({ success: false, error: 'Cannot delete employee with future appointments' });
-
-            // FIX: Soft delete (set isActive = false)
-            const result = await db.collection(collectionName).updateOne(
-              { _id: new ObjectId(req.params.id) },
-              { $set: { isActive: false, updatedAt: new Date() } }
-            );
-            if (result.matchedCount === 0) return res.status(400).json({ success: false, error: 'Document not found' });
-            return res.status(200).json({ success: true, message: 'Soft deleted successfully' });
-          }
-          // SERVICES: prevent deactivation if linked to future appointments
-          if (collectionName === 'SERVICES') {
-            const future = await db.collection('APPOINTMENTS').findOne({
-              serviceIds: new ObjectId(req.params.id),
-              date: { $gte: new Date().toISOString().slice(0, 10) }
-            });
-            if (future) return res.status(400).json({ success: false, error: 'Cannot delete service linked to future appointments' });
-
-            // FIX: Soft delete (set isActive = false)
-            const result = await db.collection(collectionName).updateOne(
-              { _id: new ObjectId(req.params.id) },
-              { $set: { isActive: false, updatedAt: new Date() } }
-            );
-            if (result.matchedCount === 0) return res.status(400).json({ success: false, error: 'Document not found' });
-            return res.status(200).json({ success: true, message: 'Soft deleted successfully' });
-          }
-
-          // Hard delete for other collections
-          try {
-            const result = await db.collection(collectionName).deleteOne({ _id: new ObjectId(req.params.id) });
-            if (result.deletedCount === 0) return res.status(400).json({ success: false, error: 'Document not found' });
-            res.status(200).json({ success: true, message: 'Deleted successfully' });
-          } catch (err) {
-            next(err);
-          }
-        }
-      );
+        try {
+          const result = await db.collection(collectionName).deleteOne({ _id: new ObjectId(req.params.id) });
+          if (result.deletedCount === 0) return res.status(404).json({ success: false, error: 'Document not found' });
+          res.status(200).json({ success: true, message: 'Deleted successfully' });
+        } catch (err) { next(err); }
+      });
     }
 
-    // Register CRUD routes for each collection (ONCE only)
+    // Register CRUD routes ONCE each
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
     crudRoutes('EMPLOYEES', 'employees');
     crudRoutes('PAYMENTS', 'payments');
     crudRoutes('SERVICES', 'services');
 
-    // --- User CRUD endpoints (admin only) ---
+    // =====================
+    // USER ADMIN ENDPOINTS
+    // =====================
     app.get('/users', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
       try {
         const { page = 1, limit = 20, email } = req.query;
         const query = {};
         if (email) query.email = email;
         const skip = (parseInt(page) - 1) * parseInt(limit);
-        const users = await db.collection('USERS')
-          .find(query)
-          .project({ password: 0 })
-          .skip(skip)
-          .limit(parseInt(limit))
-          .toArray();
+        const users = await db.collection('USERS').find(query).project({ password: 0 }).skip(skip).limit(parseInt(limit)).toArray();
         res.status(200).json({ success: true, data: users });
       } catch (err) { next(err); }
     });
 
     app.get('/users/:id', authenticateToken, authorizeRole('admin'), idValidator, async (req, res, next) => {
       try {
-        const user = await db.collection('USERS').findOne(
-          { _id: new ObjectId(req.params.id) },
-          { projection: { password: 0 } }
-        );
+        const user = await db.collection('USERS').findOne({ _id: new ObjectId(req.params.id) }, { projection: { password: 0 } });
         if (!user) return res.status(404).json({ success: false, error: 'User not found' });
         res.status(200).json({ success: true, data: user });
       } catch (err) { next(err); }
@@ -1357,7 +1069,7 @@ async function startServer() {
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
           delete req.body.password;
           req.body.updatedAt = new Date();
-          // FIX: MongoDB driver v5+ returns the document directly
+          // FIX: MongoDB driver v5+ returns document directly
           const updatedUser = await db.collection('USERS').findOneAndUpdate(
             { _id: new ObjectId(req.params.id) },
             { $set: req.body },
@@ -1377,14 +1089,14 @@ async function startServer() {
       } catch (err) { next(err); }
     });
 
-    // --- Swagger API docs endpoint (expanded) ---
+    // =====================
+    // SWAGGER
+    // =====================
     const swaggerDocument = {
       openapi: '3.0.0',
       info: { title: 'NXL Beauty Bar API', version: '1.0.0', description: 'API for booking and managing appointments.' },
       components: {
-        securitySchemes: {
-          bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' }
-        },
+        securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } },
         schemas: {
           Appointment: {
             type: 'object',
@@ -1413,68 +1125,25 @@ async function startServer() {
     };
     app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
-    // --- Pagination/filtering for other GET endpoints ---
-    function paginatedGet(collectionName, route) {
-      app.get(route, authenticateToken, [
-        param('page').optional().isInt({ min: 1 }),
-        param('limit').optional().isInt({ min: 1, max: 100 }),
-      ], async (req, res, next) => {
-        try {
-          const errors = validationResult(req);
-          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
-          const { page = 1, limit = 20, ...filters } = req.query;
-          const skip = (parseInt(page) - 1) * parseInt(limit);
-          let query = {};
-          for (const key in filters) {
-            if (typeof filters[key] === 'string') query[key] = filters[key];
-          }
-          // NO FILTERING BY USER - all users see all records
-          const docs = await db.collection(collectionName).find(query).skip(skip).limit(parseInt(limit)).toArray();
-          res.status(200).json({ success: true, data: docs });
-        } catch (err) { next(err); }
-      });
-    }
-  
-    paginatedGet('AVAILABILITY', '/availability');
-    paginatedGet('EMPLOYEES', '/employees');
-    paginatedGet('PAYMENTS', '/payments');
-    paginatedGet('SERVICES', '/services');
+    // Health check
+    app.get('/', (req, res) => res.status(200).json({ status: 'ok', env: process.env.NODE_ENV, version: '1.0.0', uptime: process.uptime() }));
 
-    // --- Health check (expanded) ---
-    app.get('/', (req, res) => res.status(200).json({
-      status: 'ok',
-      env: process.env.NODE_ENV,
-      version: '1.0.0',
-      uptime: process.uptime()
-    }));
-
-    // 404 Handler: Catch-all for routes that don't exist
+    // 404 handler
     app.use((req, res) => {
-      res.status(404).json({ 
-        success: false, 
-        error: `Route ${req.originalUrl} not found.` 
-      });
+      res.status(404).json({ success: false, error: `Route ${req.originalUrl} not found.` });
     });
 
-    // --- Centralized error handler (log errors) ---
+    // Centralized error handler
     app.use((err, req, res, next) => {
       if (err && err.message === 'Not allowed by CORS') {
         return res.status(403).json({ success: false, error: 'CORS blocked this origin' });
       }
       if (res.headersSent) return next(err);
       logger.error(err.stack);
-      if (err.name === 'UnauthorizedError') {
-        return res.status(401).json({ success: false, error: 'Invalid token' });
-      }
-      if (err.status === 400) {
-        return res.status(400).json({ success: false, error: err.message });
-      }
-      if (err.status === 404) {
-        return res.status(404).json({ success: false, error: err.message });
-      }
-      if (err.status === 409) {
-        return res.status(409).json({ success: false, error: err.message });
-      }
+      if (err.name === 'UnauthorizedError') return res.status(401).json({ success: false, error: 'Invalid token' });
+      if (err.status === 400) return res.status(400).json({ success: false, error: err.message });
+      if (err.status === 404) return res.status(404).json({ success: false, error: err.message });
+      if (err.status === 409) return res.status(409).json({ success: false, error: err.message });
       res.status(500).json({ success: false, error: 'Internal server error' });
     });
 
