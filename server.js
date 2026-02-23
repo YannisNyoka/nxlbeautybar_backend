@@ -134,6 +134,16 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
   ? [process.env.CORS_ORIGIN]
   : [/^http:\/\/localhost:\d+$/];
 
+  const cors = require('cors');
+
+// Allow specific origin (Better for security)
+app.use(cors({
+  origin: 'https://nxlbeautybar-front-cynf.vercel.app'
+}));
+
+// OR allow everything (Easy for testing, less secure)
+// app.use(cors());
+
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
