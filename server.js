@@ -131,9 +131,12 @@ const port = process.env.PORT;
 
 // --- CORS ---
 const allowedOrigins = process.env.NODE_ENV === 'production'
-  ? [process.env.CORS_ORIGIN]
+  ? [
+      process.env.CORS_ORIGIN,
+      'https://nxlbeautybar.co.za',
+      'https://www.nxlbeautybar.co.za'
+    ]
   : [/^http:\/\/localhost:\d+$/];
-
 
 
 const corsOptions = {
