@@ -12,6 +12,7 @@ const rateLimit = require('express-rate-limit');
 const swaggerUi = require('swagger-ui-express');
 const winston = require('winston');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 
 // ---- Date/time normalization helpers ----
 function pad2(n) {
@@ -124,6 +125,18 @@ function generateSlotRange(startTime, totalMinutes) {
     }
   }
   return slots;
+}
+
+// ---- PayFast signature helper ----
+function generatePayFastSignature(data, passphrase = '') {
+  let str = Object.keys(data)
+    .filter(k => data[k] !== '' && data[k] !== null && data[k] !== undefined)
+    .map(k => `${k}=${encodeURIComponent(String(data[k])).replace(/%20/g, '+')}`)
+    .join('&');
+  if (passphrase) {
+    str += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
+  }
+  return crypto.createHash('md5').update(str).digest('hex');
 }
 
 const app = express();
@@ -921,7 +934,6 @@ async function startServer() {
         }
 
         try {
-          // FIX: MongoDB driver v5+ returns the document directly, not { value: doc }
           const updatedDoc = await db.collection(collectionName).findOneAndUpdate(
             { _id: new ObjectId(req.params.id) },
             { $set: req.body },
@@ -1034,7 +1046,152 @@ async function startServer() {
       });
     }
 
+    // =====================
+    // PAYFAST PAYMENT ROUTES
+    // Must be registered BEFORE crudRoutes('PAYMENTS') to take priority
+    // =====================
+
+    // POST /payments — initiate PayFast payment
+    app.post('/payments', authenticateToken, async (req, res, next) => {
+      try {
+        const { appointmentId, amount, type } = req.body;
+
+        if (!appointmentId || !amount) {
+          return res.status(400).json({ success: false, error: 'appointmentId and amount are required' });
+        }
+
+        let apptId;
+        try { apptId = new ObjectId(appointmentId); }
+        catch { return res.status(400).json({ success: false, error: 'Invalid appointmentId' }); }
+
+        const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
+        if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
+
+        // Check not already paid
+        const existing = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
+        if (existing && existing.status === 'paid') {
+          return res.status(409).json({ success: false, error: 'Appointment already paid' });
+        }
+
+        const isSandbox = process.env.PAYFAST_SANDBOX === 'true';
+        const frontendUrl = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
+        const backendUrl = process.env.BACKEND_URL || 'https://nxlbeautybar.co.za';
+        const pfHost = isSandbox ? 'sandbox.payfast.co.za' : 'www.payfast.co.za';
+
+        // Get user details
+        const user = await db.collection('USERS').findOne(
+          { _id: new ObjectId(req.user.userId) },
+          { projection: { password: 0 } }
+        );
+
+        const parsedAmount = parseFloat(amount).toFixed(2);
+        const paymentType = type || (parseFloat(amount) < decimalToNumber(appt.totalPrice) ? 'deposit' : 'full');
+
+        const pfData = {
+          merchant_id: process.env.PAYFAST_MERCHANT_ID,
+          merchant_key: process.env.PAYFAST_MERCHANT_KEY,
+          return_url: `${frontendUrl}/payment-success?appointmentId=${appointmentId}`,
+          cancel_url: `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
+          notify_url: `${backendUrl}/api/payments/webhook`,
+          name_first: user?.firstName || 'Customer',
+          name_last: user?.lastName || '',
+          email_address: user?.email || '',
+          m_payment_id: appointmentId,
+          amount: parsedAmount,
+          item_name: 'NXL Beauty Bar Booking Fee',
+        };
+
+        pfData.signature = generatePayFastSignature(pfData, process.env.PAYFAST_PASSPHRASE);
+
+        // Upsert pending payment record (safe to retry)
+        await db.collection('PAYMENTS').updateOne(
+          { appointmentId: apptId, type: paymentType },
+          {
+            $set: {
+              appointmentId: apptId,
+              type: paymentType,
+              amount: Decimal128.fromString(parsedAmount),
+              method: 'online',
+              status: 'pending',
+              createdAt: new Date(),
+            }
+          },
+          { upsert: true }
+        );
+
+        return res.json({
+          success: true,
+          pfUrl: `https://${pfHost}/eng/process`,
+          pfData,
+        });
+
+      } catch (err) {
+        console.error('PayFast init error:', err);
+        next(err);
+      }
+    });
+
+    // POST /payments/webhook — PayFast ITN (Instant Transaction Notification)
+    // Must use urlencoded parser as PayFast sends form data
+    app.post('/payments/webhook', express.urlencoded({ extended: false }), async (req, res) => {
+      try {
+        const pfData = { ...req.body };
+        const receivedSig = pfData.signature;
+        delete pfData.signature;
+
+        // Verify signature
+        const expectedSig = generatePayFastSignature(pfData, process.env.PAYFAST_PASSPHRASE);
+        if (receivedSig !== expectedSig) {
+          console.error('PayFast ITN: signature mismatch');
+          return res.status(400).send('Invalid signature');
+        }
+
+        const appointmentId = pfData.m_payment_id;
+        let apptId;
+        try { apptId = new ObjectId(appointmentId); }
+        catch { return res.status(400).send('Invalid appointment ID'); }
+
+        if (pfData.payment_status === 'COMPLETE') {
+          // Update payment to paid
+          await db.collection('PAYMENTS').updateOne(
+            { appointmentId: apptId },
+            {
+              $set: {
+                status: 'paid',
+                payfastPaymentId: pfData.pf_payment_id,
+                paidAt: new Date(),
+              }
+            }
+          );
+
+          // Update appointment paymentStatus
+          const payment = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
+          const nextPaymentStatus = payment?.type === 'deposit' ? 'deposit_paid' : 'paid';
+
+          await db.collection('APPOINTMENTS').updateOne(
+            { _id: apptId },
+            { $set: { paymentStatus: nextPaymentStatus, updatedAt: new Date() } }
+          );
+
+          logger.info(`PayFast payment confirmed for appointment ${appointmentId}`);
+
+        } else if (pfData.payment_status === 'CANCELLED') {
+          await db.collection('PAYMENTS').updateOne(
+            { appointmentId: apptId },
+            { $set: { status: 'pending' } }
+          );
+          logger.info(`PayFast payment cancelled for appointment ${appointmentId}`);
+        }
+
+        return res.status(200).send('OK');
+      } catch (err) {
+        console.error('PayFast webhook error:', err);
+        return res.status(500).send('Error');
+      }
+    });
+
     // Register CRUD routes ONCE each
+    // NOTE: PAYMENTS is still registered here for GET/PUT/DELETE — the POST above takes priority
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
     crudRoutes('EMPLOYEES', 'employees');
@@ -1074,7 +1231,6 @@ async function startServer() {
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
           delete req.body.password;
           req.body.updatedAt = new Date();
-          // FIX: MongoDB driver v5+ returns document directly
           const updatedUser = await db.collection('USERS').findOneAndUpdate(
             { _id: new ObjectId(req.params.id) },
             { $set: req.body },
