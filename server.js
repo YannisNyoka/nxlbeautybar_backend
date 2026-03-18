@@ -1303,30 +1303,30 @@ async function startServer() {
     // =====================
     // FIX: Cleanup job is INSIDE startServer so db is available
     // =====================
-    async function cleanupPendingAppointments() {
+   async function cleanupPendingAppointments() {
   try {
     const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
 
-    // Find unpaid appointments older than 10 minutes
+    // Only delete appointments that are BOTH unpaid AND still pending
+    // This ensures paid appointments (deposit_paid or paid) are never touched
     const unpaidAppointments = await db.collection('APPOINTMENTS').find({
       paymentStatus: 'unpaid',
+      status: 'pending',          // Must still be pending (not booked by webhook yet)
       createdAt: { $lt: tenMinutesAgo }
     }).toArray();
 
     if (unpaidAppointments.length > 0) {
       const unpaidIds = unpaidAppointments.map(a => a._id);
 
-      // Delete the appointments
       const apptResult = await db.collection('APPOINTMENTS').deleteMany({
         _id: { $in: unpaidIds }
       });
 
-      // Delete their associated payment records using the appointment IDs
       const payResult = await db.collection('PAYMENTS').deleteMany({
         appointmentId: { $in: unpaidIds }
       });
 
-      logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid appointments and ${payResult.deletedCount} associated payment records`);
+      logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid pending appointments and ${payResult.deletedCount} associated payment records`);
     }
   } catch (err) {
     logger.error('Cleanup job error:', err);
