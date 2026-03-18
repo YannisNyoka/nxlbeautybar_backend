@@ -1305,14 +1305,13 @@ async function startServer() {
     // =====================
    async function cleanupPendingAppointments() {
   try {
-    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+    const twelveMinutesAgo = new Date(Date.now() - 12 * 60 * 1000);
 
-    // Only delete appointments that are BOTH unpaid AND still pending
-    // This ensures paid appointments (deposit_paid or paid) are never touched
+    // paymentStatus: 'unpaid' is the single source of truth
+    // A paid appointment will ALWAYS have deposit_paid or paid — never unpaid
     const unpaidAppointments = await db.collection('APPOINTMENTS').find({
       paymentStatus: 'unpaid',
-      status: 'pending',          // Must still be pending (not booked by webhook yet)
-      createdAt: { $lt: tenMinutesAgo }
+      createdAt: { $lt: twelveMinutesAgo }
     }).toArray();
 
     if (unpaidAppointments.length > 0) {
@@ -1326,14 +1325,13 @@ async function startServer() {
         appointmentId: { $in: unpaidIds }
       });
 
-      logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid pending appointments and ${payResult.deletedCount} associated payment records`);
+      logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid appointments and ${payResult.deletedCount} associated payment records`);
     }
   } catch (err) {
     logger.error('Cleanup job error:', err);
   }
 }
 
-// Run cleanup every 2 minutes
 setInterval(cleanupPendingAppointments, 2 * 60 * 1000);
 cleanupPendingAppointments();
 
