@@ -151,7 +151,6 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
     ]
   : [/^http:\/\/localhost:\d+$/];
 
-
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
@@ -207,13 +206,9 @@ app.options(/.*/, cors(corsOptions));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json());
 
-// ============================================================
-// FIX: Strip /api prefix so frontend calls to /api/payments
-// correctly match routes registered as /payments
-// ============================================================
 app.use((req, _res, next) => {
   if (req.url.startsWith('/api/')) {
-    req.url = req.url.slice(4); // "/api/payments" -> "/payments"
+    req.url = req.url.slice(4);
   } else if (req.url === '/api') {
     req.url = '/';
   }
@@ -354,7 +349,8 @@ const initCollections = async (db) => {
           employeeId: { bsonType: 'objectId' },
           serviceIds: { bsonType: 'array', minItems: 1, items: { bsonType: 'objectId' } },
           totalPrice: { bsonType: 'decimal', minimum: 0 },
-          status: { bsonType: 'string', enum: ['booked', 'cancelled', 'completed'] },
+          // FIX: pending added to valid statuses
+          status: { bsonType: 'string', enum: ['pending', 'booked', 'cancelled', 'completed'] },
           paymentStatus: { bsonType: 'string', enum: ['unpaid', 'deposit_paid', 'paid'] },
           createdAt: { bsonType: 'date' },
           updatedAt: { bsonType: 'date' }
@@ -800,7 +796,8 @@ async function startServer() {
           const overlapping = await db.collection('APPOINTMENTS').findOne({
             date: req.body.date,
             employeeId: req.body.employeeId,
-            time: { $in: requestedSlots }
+            time: { $in: requestedSlots },
+            status: { $nin: ['cancelled'] }
           });
           if (overlapping) return res.status(400).json({ success: false, error: 'This appointment overlaps with an existing booking' });
 
@@ -813,7 +810,7 @@ async function startServer() {
 
           const totalPrice = services.reduce((sum, s) => sum + parseFloat(s.price), 0);
           req.body.totalPrice = Decimal128.fromString(totalPrice.toFixed(2));
-          req.body.status = 'booked';
+          req.body.status = 'pending';
           if (req.user?.userId) req.body.userId = new ObjectId(req.user.userId);
           req.body.paymentStatus = 'unpaid';
         }
@@ -907,8 +904,14 @@ async function startServer() {
           const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
           if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
-          const validTransitions = { booked: ['cancelled', 'completed'], cancelled: [], completed: [] };
-          if (req.body.status && !validTransitions[appt.status].includes(req.body.status)) {
+          // FIX: Added pending to valid transitions so webhook can update pending -> booked
+          const validTransitions = {
+            pending: ['booked', 'cancelled'],
+            booked: ['cancelled', 'completed'],
+            cancelled: [],
+            completed: []
+          };
+          if (req.body.status && !validTransitions[appt.status]?.includes(req.body.status)) {
             return res.status(400).json({ success: false, error: 'Invalid status transition' });
           }
 
@@ -1048,10 +1051,8 @@ async function startServer() {
 
     // =====================
     // PAYFAST PAYMENT ROUTES
-    // Must be registered BEFORE crudRoutes('PAYMENTS') to take priority
     // =====================
 
-    // POST /payments — initiate PayFast payment
     app.post('/payments', authenticateToken, async (req, res, next) => {
       try {
         const { appointmentId, amount, type } = req.body;
@@ -1067,7 +1068,6 @@ async function startServer() {
         const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
         if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
-        // Check not already paid
         const existing = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
         if (existing && existing.status === 'paid') {
           return res.status(409).json({ success: false, error: 'Appointment already paid' });
@@ -1078,7 +1078,6 @@ async function startServer() {
         const backendUrl = process.env.BACKEND_URL || 'https://nxlbeautybar.co.za';
         const pfHost = isSandbox ? 'sandbox.payfast.co.za' : 'www.payfast.co.za';
 
-        // Get user details
         const user = await db.collection('USERS').findOne(
           { _id: new ObjectId(req.user.userId) },
           { projection: { password: 0 } }
@@ -1094,7 +1093,7 @@ async function startServer() {
           cancel_url: `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
           notify_url: `${backendUrl}/api/payments/webhook`,
           name_first: (user?.firstName || 'Customer').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
-name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
+          name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
           email_address: user?.email || '',
           m_payment_id: appointmentId,
           amount: parsedAmount,
@@ -1103,7 +1102,6 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
 
         pfData.signature = generatePayFastSignature(pfData, process.env.PAYFAST_PASSPHRASE);
 
-        // Upsert pending payment record (safe to retry)
         await db.collection('PAYMENTS').updateOne(
           { appointmentId: apptId, type: paymentType },
           {
@@ -1131,15 +1129,12 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
       }
     });
 
-    // POST /payments/webhook — PayFast ITN (Instant Transaction Notification)
-    // Must use urlencoded parser as PayFast sends form data
     app.post('/payments/webhook', express.urlencoded({ extended: false }), async (req, res) => {
       try {
         const pfData = { ...req.body };
         const receivedSig = pfData.signature;
         delete pfData.signature;
 
-        // Verify signature
         const expectedSig = generatePayFastSignature(pfData, process.env.PAYFAST_PASSPHRASE);
         if (receivedSig !== expectedSig) {
           console.error('PayFast ITN: signature mismatch');
@@ -1152,7 +1147,6 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
         catch { return res.status(400).send('Invalid appointment ID'); }
 
         if (pfData.payment_status === 'COMPLETE') {
-          // Update payment to paid
           await db.collection('PAYMENTS').updateOne(
             { appointmentId: apptId },
             {
@@ -1164,13 +1158,13 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
             }
           );
 
-          // Update appointment paymentStatus
           const payment = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
           const nextPaymentStatus = payment?.type === 'deposit' ? 'deposit_paid' : 'paid';
 
+          // FIX: Also sets status to 'booked' when payment completes
           await db.collection('APPOINTMENTS').updateOne(
             { _id: apptId },
-            { $set: { paymentStatus: nextPaymentStatus, updatedAt: new Date() } }
+            { $set: { paymentStatus: nextPaymentStatus, status: 'booked', updatedAt: new Date() } }
           );
 
           logger.info(`PayFast payment confirmed for appointment ${appointmentId}`);
@@ -1190,8 +1184,6 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
       }
     });
 
-    // Register CRUD routes ONCE each
-    // NOTE: PAYMENTS is still registered here for GET/PUT/DELETE — the POST above takes priority
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
     crudRoutes('EMPLOYEES', 'employees');
@@ -1203,7 +1195,7 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
     // =====================
     app.get('/users', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
       try {
-        const { page = 1, limit = 20, email } = req.query;
+        const { page = 1, limit = 500, email } = req.query;
         const query = {};
         if (email) query.email = email;
         const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -1268,7 +1260,7 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
               employeeId: { type: 'string' },
               serviceIds: { type: 'array', items: { type: 'string' } },
               totalPrice: { type: 'string' },
-              status: { type: 'string', enum: ['booked', 'cancelled', 'completed'] }
+              status: { type: 'string', enum: ['pending', 'booked', 'cancelled', 'completed'] }
             }
           }
         }
@@ -1307,6 +1299,43 @@ name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
       if (err.status === 409) return res.status(409).json({ success: false, error: err.message });
       res.status(500).json({ success: false, error: 'Internal server error' });
     });
+
+    // =====================
+    // FIX: Cleanup job is INSIDE startServer so db is available
+    // =====================
+    async function cleanupPendingAppointments() {
+  try {
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+
+    // Find unpaid appointments older than 10 minutes
+    const unpaidAppointments = await db.collection('APPOINTMENTS').find({
+      paymentStatus: 'unpaid',
+      createdAt: { $lt: tenMinutesAgo }
+    }).toArray();
+
+    if (unpaidAppointments.length > 0) {
+      const unpaidIds = unpaidAppointments.map(a => a._id);
+
+      // Delete the appointments
+      const apptResult = await db.collection('APPOINTMENTS').deleteMany({
+        _id: { $in: unpaidIds }
+      });
+
+      // Delete their associated payment records using the appointment IDs
+      const payResult = await db.collection('PAYMENTS').deleteMany({
+        appointmentId: { $in: unpaidIds }
+      });
+
+      logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid appointments and ${payResult.deletedCount} associated payment records`);
+    }
+  } catch (err) {
+    logger.error('Cleanup job error:', err);
+  }
+}
+
+// Run cleanup every 2 minutes
+setInterval(cleanupPendingAppointments, 2 * 60 * 1000);
+cleanupPendingAppointments();
 
     app.listen(port, () => {
       console.log(`Server is running on port: ${port}`);
