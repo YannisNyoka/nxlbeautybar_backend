@@ -202,11 +202,28 @@ app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-// Skip bodyParser.json for the webhook route — it uses express.json() directly
-// to avoid double-parsing the raw body which can break signature verification
+// For the Yoco webhook: capture raw body bytes BEFORE any parsing.
+// Signature verification must run against the exact bytes Yoco sent —
+// parsing to JSON then re-stringifying can change whitespace/key order
+// and break the HMAC. req.rawBody stores the original buffer.
+// All other routes use bodyParser.json() as normal.
 app.use((req, res, next) => {
-  if (req.path === '/payments/webhook') return next();
-  bodyParser.json()(req, res, next);
+  if (req.path === '/payments/webhook') {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      req.rawBody = Buffer.concat(chunks);
+      try {
+        req.body = JSON.parse(req.rawBody.toString('utf8'));
+      } catch {
+        req.body = {};
+      }
+      next();
+    });
+    req.on('error', next);
+  } else {
+    bodyParser.json()(req, res, next);
+  }
 });
 
 app.use((req, _res, next) => {
@@ -1053,116 +1070,51 @@ async function startServer() {
     // =====================
     // YOCO PAYMENT ROUTES
     // =====================
-    //
-    // NEW FLOW — Zero unpaid appointments in the database:
-    //
-    // 1. User confirms booking in BookingSummary → booking details saved to
-    //    localStorage only. Nothing written to DB yet.
-    //
-    // 2. POST /payments — validates slot availability, creates Yoco checkout.
-    //    Booking details (date, time, employeeId, serviceIds) stored in Yoco
-    //    metadata. No appointment created yet.
-    //
-    // 3. User pays on Yoco → redirected to /payment-success.
-    //
-    // 4. PaymentSuccess.jsx calls POST /appointments/confirm-payment with the
-    //    checkoutId + booking details → appointment created as status:booked,
-    //    paymentStatus:deposit_paid. This is the PRIMARY path.
-    //
-    // 5. Yoco webhook (payment.succeeded) fires simultaneously as BACKUP —
-    //    creates the appointment if PaymentSuccess hasn't already (idempotent).
-    //
-    // Result: Only paid appointments ever enter the database.
-    // =====================
 
-    // Step 1: Create Yoco checkout — validate slot, store booking in metadata
+    // Create Yoco checkout session using existing appointmentId.
+    // Appointment already exists (created by BookingSummary).
+    // This route looks it up and creates a Yoco checkout for the deposit.
+    // After payment, webhook updates appointment to booked + deposit_paid.
     app.post('/payments', authenticateToken, async (req, res, next) => {
       try {
-        const { date, time, employeeId, serviceIds, contactNumber, userName } = req.body;
+        const { appointmentId } = req.body;
 
-        if (!date || !time || !employeeId || !serviceIds?.length) {
-          return res.status(400).json({ success: false, error: 'date, time, employeeId and serviceIds are required' });
+        if (!appointmentId) {
+          return res.status(400).json({ success: false, error: 'appointmentId is required' });
         }
 
-        let empId;
-        try { empId = new ObjectId(employeeId); }
-        catch { return res.status(400).json({ success: false, error: 'Invalid employeeId' }); }
+        let apptId;
+        try { apptId = new ObjectId(appointmentId); }
+        catch { return res.status(400).json({ success: false, error: 'Invalid appointmentId' }); }
 
-        let svcIds;
-        try { svcIds = serviceIds.map(id => new ObjectId(id)); }
-        catch { return res.status(400).json({ success: false, error: 'Invalid serviceIds' }); }
+        const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
+        if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
-        const emp = await db.collection('EMPLOYEES').findOne({ _id: empId, isActive: true });
-        if (!emp) return res.status(400).json({ success: false, error: 'Employee not found or inactive' });
-
-        const services = await db.collection('SERVICES').find({ _id: { $in: svcIds }, isActive: true }).toArray();
-        if (services.length !== svcIds.length) {
-          return res.status(400).json({ success: false, error: 'One or more services not found or inactive' });
+        // Block if already paid
+        const existing = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
+        if (existing && existing.status === 'paid') {
+          return res.status(409).json({ success: false, error: 'Appointment already paid' });
         }
 
-        const normalizedDate = normalizeDateToISO(date);
-        const normalizedTime = normalizeTimeTo24h(time);
-        if (!normalizedDate || !normalizedTime) {
-          return res.status(400).json({ success: false, error: 'Invalid date or time format' });
-        }
+        const frontendUrl   = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
+        const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
+        const amountInCents = Math.round(depositAmount * 100);
 
-        // Check slot availability BEFORE charging the customer
-        const totalDuration = services.reduce((sum, s) => sum + s.durationMinutes, 0);
-        const requestedSlots = generateSlotRange(normalizedTime, totalDuration);
+        logger.info('Yoco: creating checkout session', { appointmentId, amountInCents });
 
-        const overlapping = await db.collection('APPOINTMENTS').findOne({
-          date: normalizedDate,
-          employeeId: empId,
-          time: { $in: requestedSlots },
-          status: { $nin: ['cancelled'] },
-        });
-        if (overlapping) {
-          return res.status(409).json({
-            success: false,
-            error: 'This time slot is no longer available. Please go back and select another time.',
-          });
-        }
-
-        const blocked = await db.collection('AVAILABILITY').findOne({
-          date: normalizedDate,
-          time: { $in: requestedSlots },
-          $or: [{ employeeId: empId }, { employeeId: 'ALL' }],
-        });
-        if (blocked) {
-          return res.status(409).json({ success: false, error: 'One or more time slots are unavailable.' });
-        }
-
-        const frontendUrl    = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
-        const depositAmount  = Number(process.env.DEPOSIT_AMOUNT || 100);
-        const amountInCents  = Math.round(depositAmount * 100);
-        const userId         = req.user?.userId;
-
-        logger.info('Yoco: creating checkout session', { date: normalizedDate, time: normalizedTime, amountInCents });
-
-        // All booking details go into Yoco metadata so the webhook and
-        // PaymentSuccess page can create the appointment after payment
         const yocoResponse = await fetchFn('https://payments.yoco.com/api/checkouts', {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
+            'Content-Type':  'application/json',
             'Authorization': `Bearer ${process.env.YOCO_SECRET_KEY}`,
           },
           body: JSON.stringify({
             amount:     amountInCents,
             currency:   'ZAR',
-            successUrl: `${frontendUrl}/payment-success`,
-            cancelUrl:  `${frontendUrl}/payment-cancel`,
-            failureUrl: `${frontendUrl}/payment-cancel`,
-            metadata: {
-              userId:        userId  || '',
-              employeeId:    employeeId,
-              serviceIds:    serviceIds.join(','),
-              date:          normalizedDate,
-              time:          normalizedTime,
-              contactNumber: contactNumber || '',
-              userName:      userName      || '',
-              depositAmount: depositAmount.toFixed(2),
-            },
+            successUrl: `${frontendUrl}/payment-success?appointmentId=${appointmentId}`,
+            cancelUrl:  `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
+            failureUrl: `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
+            metadata: { appointmentId },
           }),
         });
 
@@ -1174,10 +1126,24 @@ async function startServer() {
 
         const yocoData = await yocoResponse.json();
 
-        logger.info('Yoco: checkout session created', {
-          checkoutId:  yocoData.id,
-          redirectUrl: yocoData.redirectUrl,
-        });
+        logger.info('Yoco: checkout session created', { appointmentId, checkoutId: yocoData.id });
+
+        // Save pending payment record
+        await db.collection('PAYMENTS').updateOne(
+          { appointmentId: apptId, type: 'deposit' },
+          {
+            $set: {
+              appointmentId:  apptId,
+              type:           'deposit',
+              amount:         Decimal128.fromString(depositAmount.toFixed(2)),
+              method:         'online',
+              status:         'pending',
+              yocoCheckoutId: yocoData.id,
+            },
+            $setOnInsert: { createdAt: new Date() }
+          },
+          { upsert: true }
+        );
 
         return res.json({
           success:     true,
@@ -1191,98 +1157,9 @@ async function startServer() {
       }
     });
 
-    // Step 2: Called by PaymentSuccess.jsx after Yoco redirects back.
-    // Creates the appointment + payment record as already booked + paid.
-    // Uses checkoutId as idempotency key to prevent duplicates.
-    // This is the PRIMARY path — webhook is the backup.
-    app.post('/appointments/confirm-payment', authenticateToken, async (req, res, next) => {
-      try {
-        const { checkoutId, date, time, employeeId, serviceIds, contactNumber, userName } = req.body;
-
-        if (!checkoutId || !date || !time || !employeeId || !serviceIds?.length) {
-          return res.status(400).json({ success: false, error: 'Missing required fields' });
-        }
-
-        // Idempotency check — prevent duplicate if page is refreshed
-        const existing = await db.collection('APPOINTMENTS').findOne({ yocoCheckoutId: checkoutId });
-        if (existing) {
-          logger.info('confirm-payment: appointment already exists', { checkoutId, _id: existing._id });
-          return res.status(200).json({ success: true, data: existing, alreadyExists: true });
-        }
-
-        let empId;
-        try { empId = new ObjectId(employeeId); }
-        catch { return res.status(400).json({ success: false, error: 'Invalid employeeId' }); }
-
-        let svcIds;
-        try { svcIds = serviceIds.map(id => new ObjectId(id)); }
-        catch { return res.status(400).json({ success: false, error: 'Invalid serviceIds' }); }
-
-        const normalizedDate = normalizeDateToISO(date);
-        const normalizedTime = normalizeTimeTo24h(time);
-
-        const services = await db.collection('SERVICES').find({ _id: { $in: svcIds } }).toArray();
-        const totalPrice    = services.reduce((sum, s) => sum + parseFloat(s.price.toString()), 0);
-        const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
-        const userId        = req.user?.userId ? new ObjectId(req.user.userId) : null;
-        const now           = new Date();
-
-        // Create appointment directly as booked + deposit_paid — never unpaid
-        const appointment = {
-          date:           normalizedDate,
-          time:           normalizedTime,
-          userId:         userId,
-          employeeId:     empId,
-          serviceIds:     svcIds,
-          totalPrice:     Decimal128.fromString(totalPrice.toFixed(2)),
-          status:         'booked',
-          paymentStatus:  'deposit_paid',
-          contactNumber:  contactNumber || '',
-          yocoCheckoutId: checkoutId,
-          createdAt:      now,
-          updatedAt:      now,
-        };
-
-        const apptResult = await db.collection('APPOINTMENTS').insertOne(appointment);
-
-        await db.collection('PAYMENTS').insertOne({
-          appointmentId:  apptResult.insertedId,
-          type:           'deposit',
-          amount:         Decimal128.fromString(depositAmount.toFixed(2)),
-          method:         'online',
-          status:         'paid',
-          yocoCheckoutId: checkoutId,
-          paidAt:         now,
-          createdAt:      now,
-        });
-
-        logger.info('confirm-payment: appointment created after payment', {
-          appointmentId: apptResult.insertedId,
-          checkoutId,
-          date: normalizedDate,
-          time: normalizedTime,
-        });
-
-        res.status(201).json({
-          success: true,
-          data: { ...appointment, _id: apptResult.insertedId },
-        });
-
-      } catch (err) {
-        // Handle race condition: webhook already created appointment
-        if (err.code === 11000) {
-          const existing = await db.collection('APPOINTMENTS').findOne({ yocoCheckoutId: req.body?.checkoutId }).catch(() => null);
-          if (existing) return res.status(200).json({ success: true, data: existing, alreadyExists: true });
-        }
-        logger.error('confirm-payment error:', err);
-        next(err);
-      }
-    });
-
-    // Step 3: Yoco webhook — payment.succeeded fires after Yoco processes payment.
-    // This is the BACKUP path. Creates the appointment if PaymentSuccess hasn't already.
-    // Responds 200 immediately and processes async to avoid Yoco timeout.
-    app.post('/payments/webhook', express.json(), (req, res) => {
+        // Webhook: raw body is already captured by the middleware above (req.rawBody).
+    // No express.json() here — body was parsed from rawBody in the middleware.
+    app.post('/payments/webhook', (req, res) => {
       res.status(200).send('OK');
 
       setImmediate(async () => {
@@ -1300,7 +1177,8 @@ async function startServer() {
             return;
           }
 
-          // Verify webhook signature if YOCO_WEBHOOK_SECRET is configured
+          // Verify signature against the RAW bytes Yoco sent — not re-serialized JSON.
+          // This is the correct approach: HMAC(raw_bytes) must equal x-yoco-signature.
           const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
           if (webhookSecret) {
             const receivedSig = req.headers['x-yoco-signature'];
@@ -1308,91 +1186,63 @@ async function startServer() {
               logger.error('Yoco webhook: missing x-yoco-signature header');
               return;
             }
+            if (!req.rawBody) {
+              logger.error('Yoco webhook: rawBody not available — cannot verify signature');
+              return;
+            }
             const expectedSig = crypto
               .createHmac('sha256', webhookSecret)
-              .update(JSON.stringify(event))
+              .update(req.rawBody)   // ← raw bytes, not JSON.stringify(event)
               .digest('hex');
             if (receivedSig !== expectedSig) {
               logger.error('Yoco webhook: signature mismatch', { received: receivedSig, expected: expectedSig });
               return;
             }
+            logger.info('Yoco webhook: signature verified OK');
           } else {
             logger.warn('Yoco webhook: YOCO_WEBHOOK_SECRET not set — skipping signature check');
           }
 
           if (event.type === 'payment.succeeded') {
-            const meta = event.payload?.metadata || {};
-            const checkoutId = event.payload?.id || '';
+            // Old flow: appointment already exists, just update it to booked + deposit_paid
+            const appointmentId = event.payload?.metadata?.appointmentId;
 
-            logger.info('Yoco webhook: processing payment.succeeded', { checkoutId, meta });
-
-            // Idempotency — skip if PaymentSuccess already created this appointment
-            const existing = await db.collection('APPOINTMENTS').findOne({ yocoCheckoutId: checkoutId });
-            if (existing) {
-              logger.info('Yoco webhook: appointment already exists (created by PaymentSuccess)', { checkoutId, _id: existing._id });
+            if (!appointmentId) {
+              logger.error('Yoco webhook: payment.succeeded but no appointmentId in metadata', { payload: event.payload });
               return;
             }
 
-            // Backup: create appointment from metadata stored in the Yoco checkout
-            const { employeeId, serviceIds: serviceIdsStr, date, time, userId: userIdStr, contactNumber, depositAmount } = meta;
+            let apptId;
+            try { apptId = new ObjectId(appointmentId); }
+            catch { logger.error('Yoco webhook: invalid appointmentId', { appointmentId }); return; }
 
-            if (!employeeId || !serviceIdsStr || !date || !time) {
-              logger.error('Yoco webhook: missing required metadata fields', { meta });
-              return;
-            }
+            logger.info('Yoco webhook: processing payment.succeeded', { appointmentId });
 
-            let empId, svcIds, userId;
-            try { empId = new ObjectId(employeeId); } catch { logger.error('Yoco webhook: invalid employeeId', { employeeId }); return; }
-            try { svcIds = serviceIdsStr.split(',').map(id => new ObjectId(id.trim())); } catch { logger.error('Yoco webhook: invalid serviceIds', { serviceIdsStr }); return; }
-            try { userId = userIdStr ? new ObjectId(userIdStr) : null; } catch { userId = null; }
+            // Update payment record to paid
+            await db.collection('PAYMENTS').updateOne(
+              { appointmentId: apptId },
+              {
+                $set: {
+                  status:        'paid',
+                  yocoPaymentId: event.payload?.id,
+                  paidAt:        new Date(),
+                }
+              }
+            );
 
-            const normalizedDate = normalizeDateToISO(date);
-            const normalizedTime = normalizeTimeTo24h(time);
-            if (!normalizedDate || !normalizedTime) {
-              logger.error('Yoco webhook: invalid date/time in metadata', { date, time });
-              return;
-            }
+            // Update appointment to booked with deposit paid
+            await db.collection('APPOINTMENTS').updateOne(
+              { _id: apptId },
+              {
+                $set: {
+                  paymentStatus: 'deposit_paid',
+                  status:        'booked',
+                  updatedAt:     new Date(),
+                }
+              }
+            );
 
-            const services   = await db.collection('SERVICES').find({ _id: { $in: svcIds } }).toArray();
-            const totalPrice = services.reduce((sum, s) => sum + parseFloat(s.price.toString()), 0);
-            const deposit    = parseFloat(depositAmount || process.env.DEPOSIT_AMOUNT || 100);
-            const now        = new Date();
-
-            const appointment = {
-              date:           normalizedDate,
-              time:           normalizedTime,
-              userId:         userId,
-              employeeId:     empId,
-              serviceIds:     svcIds,
-              totalPrice:     Decimal128.fromString(totalPrice.toFixed(2)),
-              status:         'booked',
-              paymentStatus:  'deposit_paid',
-              contactNumber:  contactNumber || '',
-              yocoCheckoutId: checkoutId,
-              createdAt:      now,
-              updatedAt:      now,
-            };
-
-            const apptResult = await db.collection('APPOINTMENTS').insertOne(appointment);
-
-            await db.collection('PAYMENTS').insertOne({
-              appointmentId:  apptResult.insertedId,
-              type:           'deposit',
-              amount:         Decimal128.fromString(deposit.toFixed(2)),
-              method:         'online',
-              status:         'paid',
-              yocoCheckoutId: checkoutId,
-              yocoPaymentId:  event.payload?.id,
-              paidAt:         now,
-              createdAt:      now,
-            });
-
-            logger.info('Yoco webhook: appointment created (backup path)', {
-              appointmentId: apptResult.insertedId,
-              checkoutId,
-              date: normalizedDate,
-              time: normalizedTime,
-            });
+            logger.info('Yoco webhook: appointment successfully booked', { appointmentId });
 
           } else if (event.type === 'payment.failed') {
             logger.info('Yoco webhook: payment.failed', { checkoutId: event.payload?.id });
@@ -1407,7 +1257,7 @@ async function startServer() {
         } catch (err) {
           // Duplicate key = race condition, appointment already created — safe to ignore
           if (err.code === 11000) {
-            logger.info('Yoco webhook: duplicate key — appointment already created by confirm-payment route');
+            logger.info('Yoco webhook: duplicate key — payment already processed.');
             return;
           }
           logger.error('Yoco webhook processing error', { error: err.message, stack: err.stack });
