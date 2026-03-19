@@ -349,7 +349,6 @@ const initCollections = async (db) => {
           employeeId: { bsonType: 'objectId' },
           serviceIds: { bsonType: 'array', minItems: 1, items: { bsonType: 'objectId' } },
           totalPrice: { bsonType: 'decimal', minimum: 0 },
-          // FIX: pending added to valid statuses
           status: { bsonType: 'string', enum: ['pending', 'booked', 'cancelled', 'completed'] },
           paymentStatus: { bsonType: 'string', enum: ['unpaid', 'deposit_paid', 'paid'] },
           createdAt: { bsonType: 'date' },
@@ -904,7 +903,6 @@ async function startServer() {
           const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
           if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
-          // FIX: Added pending to valid transitions so webhook can update pending -> booked
           const validTransitions = {
             pending: ['booked', 'cancelled'],
             booked: ['cancelled', 'completed'],
@@ -1102,6 +1100,8 @@ async function startServer() {
 
         pfData.signature = generatePayFastSignature(pfData, process.env.PAYFAST_PASSPHRASE);
 
+        // FIX: Use $setOnInsert for createdAt so it is never overwritten on retry
+        // This preserves the original creation time so cleanup works correctly
         await db.collection('PAYMENTS').updateOne(
           { appointmentId: apptId, type: paymentType },
           {
@@ -1111,7 +1111,9 @@ async function startServer() {
               amount: Decimal128.fromString(parsedAmount),
               method: 'online',
               status: 'pending',
-              createdAt: new Date(),
+            },
+            $setOnInsert: {
+              createdAt: new Date(), // Only set on first insert, never overwritten on retry
             }
           },
           { upsert: true }
@@ -1129,6 +1131,7 @@ async function startServer() {
       }
     });
 
+    // FIX: Read payment BEFORE updating it so nextPaymentStatus is always correct
     app.post('/payments/webhook', express.urlencoded({ extended: false }), async (req, res) => {
       try {
         const pfData = { ...req.body };
@@ -1147,6 +1150,12 @@ async function startServer() {
         catch { return res.status(400).send('Invalid appointment ID'); }
 
         if (pfData.payment_status === 'COMPLETE') {
+          // FIX: Read payment type BEFORE updating status
+          // This guarantees nextPaymentStatus is always correct
+          const payment = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
+          const nextPaymentStatus = payment?.type === 'deposit' ? 'deposit_paid' : 'paid';
+
+          // Now update payment to paid
           await db.collection('PAYMENTS').updateOne(
             { appointmentId: apptId },
             {
@@ -1158,10 +1167,7 @@ async function startServer() {
             }
           );
 
-          const payment = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
-          const nextPaymentStatus = payment?.type === 'deposit' ? 'deposit_paid' : 'paid';
-
-          // FIX: Also sets status to 'booked' when payment completes
+          // Update appointment with correct paymentStatus and mark as booked
           await db.collection('APPOINTMENTS').updateOne(
             { _id: apptId },
             { $set: { paymentStatus: nextPaymentStatus, status: 'booked', updatedAt: new Date() } }
@@ -1301,39 +1307,42 @@ async function startServer() {
     });
 
     // =====================
-    // FIX: Cleanup job is INSIDE startServer so db is available
+    // CLEANUP: Delete unpaid appointments older than 30 minutes
+    // Uses paymentStatus: 'unpaid' as single source of truth
+    // Paid appointments always have deposit_paid or paid — never unpaid
+    // $setOnInsert ensures createdAt is never reset on payment retries
     // =====================
-   async function cleanupPendingAppointments() {
-  try {
-    const twelveMinutesAgo = new Date(Date.now() - 12 * 60 * 1000);
+    async function cleanupPendingAppointments() {
+      try {
+        const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
 
-    // paymentStatus: 'unpaid' is the single source of truth
-    // A paid appointment will ALWAYS have deposit_paid or paid — never unpaid
-    const unpaidAppointments = await db.collection('APPOINTMENTS').find({
-      paymentStatus: 'unpaid',
-      createdAt: { $lt: twelveMinutesAgo }
-    }).toArray();
+        const unpaidAppointments = await db.collection('APPOINTMENTS').find({
+          paymentStatus: 'unpaid',
+          createdAt: { $lt: thirtyMinutesAgo }
+        }).toArray();
 
-    if (unpaidAppointments.length > 0) {
-      const unpaidIds = unpaidAppointments.map(a => a._id);
+        if (unpaidAppointments.length > 0) {
+          const unpaidIds = unpaidAppointments.map(a => a._id);
 
-      const apptResult = await db.collection('APPOINTMENTS').deleteMany({
-        _id: { $in: unpaidIds }
-      });
+          const apptResult = await db.collection('APPOINTMENTS').deleteMany({
+            _id: { $in: unpaidIds }
+          });
 
-      const payResult = await db.collection('PAYMENTS').deleteMany({
-        appointmentId: { $in: unpaidIds }
-      });
+          const payResult = await db.collection('PAYMENTS').deleteMany({
+            appointmentId: { $in: unpaidIds }
+          });
 
-      logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid appointments and ${payResult.deletedCount} associated payment records`);
+          logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid appointments and ${payResult.deletedCount} associated payment records`);
+        }
+      } catch (err) {
+        logger.error('Cleanup job error:', err);
+      }
     }
-  } catch (err) {
-    logger.error('Cleanup job error:', err);
-  }
-}
 
-setInterval(cleanupPendingAppointments, 2 * 60 * 1000);
-cleanupPendingAppointments();
+    // Run cleanup every 10 minutes
+    setInterval(cleanupPendingAppointments, 10 * 60 * 1000);
+    // Also run immediately on startup
+    cleanupPendingAppointments();
 
     app.listen(port, () => {
       console.log(`Server is running on port: ${port}`);
