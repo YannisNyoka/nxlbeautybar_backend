@@ -1313,37 +1313,35 @@ async function startServer() {
     // $setOnInsert ensures createdAt is never reset on payment retries
     // =====================
     async function cleanupPendingAppointments() {
-      try {
-        const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+  try {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-        const unpaidAppointments = await db.collection('APPOINTMENTS').find({
-          paymentStatus: 'unpaid',
-          createdAt: { $lt: thirtyMinutesAgo }
-        }).toArray();
+    const unpaidAppointments = await db.collection('APPOINTMENTS').find({
+      paymentStatus: 'unpaid',
+      createdAt: { $lt: twentyFourHoursAgo }
+    }).toArray();
 
-        if (unpaidAppointments.length > 0) {
-          const unpaidIds = unpaidAppointments.map(a => a._id);
+    if (unpaidAppointments.length > 0) {
+      const unpaidIds = unpaidAppointments.map(a => a._id);
 
-          const apptResult = await db.collection('APPOINTMENTS').deleteMany({
-            _id: { $in: unpaidIds }
-          });
+      const apptResult = await db.collection('APPOINTMENTS').deleteMany({
+        _id: { $in: unpaidIds }
+      });
 
-          const payResult = await db.collection('PAYMENTS').deleteMany({
-            appointmentId: { $in: unpaidIds }
-          });
+      const payResult = await db.collection('PAYMENTS').deleteMany({
+        appointmentId: { $in: unpaidIds }
+      });
 
-          logger.info(`Auto-deleted ${apptResult.deletedCount} unpaid appointments and ${payResult.deletedCount} associated payment records`);
-        }
-      } catch (err) {
-        logger.error('Cleanup job error:', err);
-      }
+      logger.info(`Auto-cleaned ${apptResult.deletedCount} abandoned unpaid appointments older than 24 hours`);
     }
+  } catch (err) {
+    logger.error('Cleanup job error:', err);
+  }
+}
 
-    // Run cleanup every 10 minutes
-    setInterval(cleanupPendingAppointments, 10 * 60 * 1000);
-    // Also run immediately on startup
-    cleanupPendingAppointments();
-
+// Run once every 6 hours — no need to run frequently at 24h threshold
+setInterval(cleanupPendingAppointments, 6 * 60 * 60 * 1000);
+cleanupPendingAppointments();
     app.listen(port, () => {
       console.log(`Server is running on port: ${port}`);
     });
