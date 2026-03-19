@@ -1204,8 +1204,8 @@ async function startServer() {
           }
 
           if (event.type === 'payment.succeeded') {
-            // Old flow: appointment already exists, just update it to booked + deposit_paid
             const appointmentId = event.payload?.metadata?.appointmentId;
+            const checkoutId    = event.payload?.id;
 
             if (!appointmentId) {
               logger.error('Yoco webhook: payment.succeeded but no appointmentId in metadata', { payload: event.payload });
@@ -1216,22 +1216,46 @@ async function startServer() {
             try { apptId = new ObjectId(appointmentId); }
             catch { logger.error('Yoco webhook: invalid appointmentId', { appointmentId }); return; }
 
-            logger.info('Yoco webhook: processing payment.succeeded', { appointmentId });
+            logger.info('Yoco webhook: processing payment.succeeded', { appointmentId, checkoutId });
 
-            // Update payment record to paid
-            await db.collection('PAYMENTS').updateOne(
-              { appointmentId: apptId },
+            // ✅ Idempotency — check PAYMENTS collection for already-paid record
+            const alreadyPaid = await db.collection('PAYMENTS').findOne({
+              appointmentId: apptId,
+              status: 'paid'
+            });
+            if (alreadyPaid) {
+              logger.info('Yoco webhook: already processed — skipping duplicate', { appointmentId });
+              return;
+            }
+
+            // ✅ Amount validation — ensure Yoco paid the correct deposit amount
+            const expectedAmount = Math.round(Number(process.env.DEPOSIT_AMOUNT || 100) * 100);
+            const paidAmount     = event.payload?.amount;
+            if (paidAmount !== expectedAmount) {
+              logger.error('Yoco webhook: amount mismatch', { expectedAmount, paidAmount, appointmentId });
+              return;
+            }
+
+            // ✅ Update payment record — match by appointmentId + checkoutId for precision
+            const paymentResult = await db.collection('PAYMENTS').updateOne(
+              { appointmentId: apptId, yocoCheckoutId: checkoutId },
               {
                 $set: {
                   status:        'paid',
-                  yocoPaymentId: event.payload?.id,
+                  yocoPaymentId: checkoutId,
                   paidAt:        new Date(),
+                  updatedAt:     new Date(),
                 }
               }
             );
 
-            // Update appointment to booked with deposit paid
-            await db.collection('APPOINTMENTS').updateOne(
+            if (paymentResult.matchedCount === 0) {
+              logger.error('Yoco webhook: CRITICAL — payment record not found', { appointmentId, checkoutId });
+              // Still attempt appointment update so the booking isn't lost
+            }
+
+            // ✅ Update appointment to booked + deposit_paid
+            const apptResult = await db.collection('APPOINTMENTS').updateOne(
               { _id: apptId },
               {
                 $set: {
@@ -1241,6 +1265,11 @@ async function startServer() {
                 }
               }
             );
+
+            if (apptResult.matchedCount === 0) {
+              logger.error('Yoco webhook: CRITICAL — appointment not found after payment', { appointmentId, checkoutId });
+              return;
+            }
 
             logger.info('Yoco webhook: appointment successfully booked', { appointmentId });
 
