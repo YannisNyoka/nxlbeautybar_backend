@@ -1255,205 +1255,141 @@ async function startServer() {
       }
     });
 
-// IMPORTANT: use raw body, NOT express.json()
-app.post('/payments/webhook',
-  express.raw({ type: 'application/json' }),
-  (req, res) => {
+    // Step 3: Yoco webhook — payment.succeeded fires after Yoco processes payment.
+    // This is the BACKUP path. Creates the appointment if PaymentSuccess hasn't already.
+    // Responds 200 immediately and processes async to avoid Yoco timeout.
+    app.post('/payments/webhook', express.json(), (req, res) => {
+      res.status(200).send('OK');
 
-    // ✅ Respond immediately (Yoco requirement)
-    res.status(200).send('OK');
+      setImmediate(async () => {
+        try {
+          const event = req.body;
 
-    setImmediate(async () => {
-      try {
-        const rawBody = req.body; // Buffer
-        const event = JSON.parse(rawBody.toString());
+          logger.info('Yoco webhook received', {
+            type:      event.type,
+            payloadId: event.payload?.id,
+            metadata:  event.payload?.metadata,
+          });
 
-        logger.info('Yoco webhook received', {
-          type: event.type,
-          payloadId: event.payload?.id,
-          metadata: event.payload?.metadata,
-        });
-
-        if (!event?.type) {
-          logger.error('Yoco webhook: empty or malformed body');
-          return;
-        }
-
-        // ✅ FIXED: Proper signature verification using RAW BODY
-        const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
-
-        if (webhookSecret) {
-          const receivedSig = req.headers['x-yoco-signature'];
-
-          if (!receivedSig) {
-            logger.error('Yoco webhook: missing x-yoco-signature header');
+          if (!event?.type) {
+            logger.error('Yoco webhook: empty or malformed body');
             return;
           }
 
-          const expectedSig = crypto
-            .createHmac('sha256', webhookSecret)
-            .update(rawBody) // ✅ CRITICAL FIX
-            .digest('hex');
+          // Verify webhook signature if YOCO_WEBHOOK_SECRET is configured
+          const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
+          if (webhookSecret) {
+            const receivedSig = req.headers['x-yoco-signature'];
+            if (!receivedSig) {
+              logger.error('Yoco webhook: missing x-yoco-signature header');
+              return;
+            }
+            const expectedSig = crypto
+              .createHmac('sha256', webhookSecret)
+              .update(JSON.stringify(event))
+              .digest('hex');
+            if (receivedSig !== expectedSig) {
+              logger.error('Yoco webhook: signature mismatch', { received: receivedSig, expected: expectedSig });
+              return;
+            }
+          } else {
+            logger.warn('Yoco webhook: YOCO_WEBHOOK_SECRET not set — skipping signature check');
+          }
 
-          if (receivedSig !== expectedSig) {
-            logger.error('Yoco webhook: signature mismatch', {
-              received: receivedSig,
-              expected: expectedSig
+          if (event.type === 'payment.succeeded') {
+            const meta = event.payload?.metadata || {};
+            const checkoutId = event.payload?.id || '';
+
+            logger.info('Yoco webhook: processing payment.succeeded', { checkoutId, meta });
+
+            // Idempotency — skip if PaymentSuccess already created this appointment
+            const existing = await db.collection('APPOINTMENTS').findOne({ yocoCheckoutId: checkoutId });
+            if (existing) {
+              logger.info('Yoco webhook: appointment already exists (created by PaymentSuccess)', { checkoutId, _id: existing._id });
+              return;
+            }
+
+            // Backup: create appointment from metadata stored in the Yoco checkout
+            const { employeeId, serviceIds: serviceIdsStr, date, time, userId: userIdStr, contactNumber, depositAmount } = meta;
+
+            if (!employeeId || !serviceIdsStr || !date || !time) {
+              logger.error('Yoco webhook: missing required metadata fields', { meta });
+              return;
+            }
+
+            let empId, svcIds, userId;
+            try { empId = new ObjectId(employeeId); } catch { logger.error('Yoco webhook: invalid employeeId', { employeeId }); return; }
+            try { svcIds = serviceIdsStr.split(',').map(id => new ObjectId(id.trim())); } catch { logger.error('Yoco webhook: invalid serviceIds', { serviceIdsStr }); return; }
+            try { userId = userIdStr ? new ObjectId(userIdStr) : null; } catch { userId = null; }
+
+            const normalizedDate = normalizeDateToISO(date);
+            const normalizedTime = normalizeTimeTo24h(time);
+            if (!normalizedDate || !normalizedTime) {
+              logger.error('Yoco webhook: invalid date/time in metadata', { date, time });
+              return;
+            }
+
+            const services   = await db.collection('SERVICES').find({ _id: { $in: svcIds } }).toArray();
+            const totalPrice = services.reduce((sum, s) => sum + parseFloat(s.price.toString()), 0);
+            const deposit    = parseFloat(depositAmount || process.env.DEPOSIT_AMOUNT || 100);
+            const now        = new Date();
+
+            const appointment = {
+              date:           normalizedDate,
+              time:           normalizedTime,
+              userId:         userId,
+              employeeId:     empId,
+              serviceIds:     svcIds,
+              totalPrice:     Decimal128.fromString(totalPrice.toFixed(2)),
+              status:         'booked',
+              paymentStatus:  'deposit_paid',
+              contactNumber:  contactNumber || '',
+              yocoCheckoutId: checkoutId,
+              createdAt:      now,
+              updatedAt:      now,
+            };
+
+            const apptResult = await db.collection('APPOINTMENTS').insertOne(appointment);
+
+            await db.collection('PAYMENTS').insertOne({
+              appointmentId:  apptResult.insertedId,
+              type:           'deposit',
+              amount:         Decimal128.fromString(deposit.toFixed(2)),
+              method:         'online',
+              status:         'paid',
+              yocoCheckoutId: checkoutId,
+              yocoPaymentId:  event.payload?.id,
+              paidAt:         now,
+              createdAt:      now,
             });
-            return;
-          }
-        } else {
-          logger.warn('Yoco webhook: YOCO_WEBHOOK_SECRET not set — skipping signature check');
-        }
 
-        // ============================
-        // HANDLE EVENTS
-        // ============================
-
-        if (event.type === 'payment.succeeded') {
-          const meta = event.payload?.metadata || {};
-          const checkoutId = event.payload?.id || '';
-
-          logger.info('Yoco webhook: processing payment.succeeded', { checkoutId, meta });
-
-          // ✅ Idempotency check
-          const existing = await db.collection('APPOINTMENTS')
-            .findOne({ yocoCheckoutId: checkoutId });
-
-          if (existing) {
-            logger.info('Yoco webhook: appointment already exists', {
+            logger.info('Yoco webhook: appointment created (backup path)', {
+              appointmentId: apptResult.insertedId,
               checkoutId,
-              _id: existing._id
+              date: normalizedDate,
+              time: normalizedTime,
             });
+
+          } else if (event.type === 'payment.failed') {
+            logger.info('Yoco webhook: payment.failed', { checkoutId: event.payload?.id });
+
+          } else if (event.type === 'checkout.cancelled') {
+            logger.info('Yoco webhook: checkout.cancelled', { checkoutId: event.payload?.id });
+
+          } else {
+            logger.info('Yoco webhook: unhandled event type', { type: event.type });
+          }
+
+        } catch (err) {
+          // Duplicate key = race condition, appointment already created — safe to ignore
+          if (err.code === 11000) {
+            logger.info('Yoco webhook: duplicate key — appointment already created by confirm-payment route');
             return;
           }
-
-          const {
-            employeeId,
-            serviceIds: serviceIdsStr,
-            date,
-            time,
-            userId: userIdStr,
-            contactNumber,
-            depositAmount
-          } = meta;
-
-          if (!employeeId || !serviceIdsStr || !date || !time) {
-            logger.error('Yoco webhook: missing metadata fields', { meta });
-            return;
-          }
-
-          let empId, svcIds, userId;
-
-          try {
-            empId = new ObjectId(employeeId);
-          } catch {
-            logger.error('Invalid employeeId', { employeeId });
-            return;
-          }
-
-          try {
-            svcIds = serviceIdsStr.split(',')
-              .map(id => new ObjectId(id.trim()));
-          } catch {
-            logger.error('Invalid serviceIds', { serviceIdsStr });
-            return;
-          }
-
-          try {
-            userId = userIdStr ? new ObjectId(userIdStr) : null;
-          } catch {
-            userId = null;
-          }
-
-          const normalizedDate = normalizeDateToISO(date);
-          const normalizedTime = normalizeTimeTo24h(time);
-
-          if (!normalizedDate || !normalizedTime) {
-            logger.error('Invalid date/time', { date, time });
-            return;
-          }
-
-          const services = await db.collection('SERVICES')
-            .find({ _id: { $in: svcIds } })
-            .toArray();
-
-          const totalPrice = services.reduce(
-            (sum, s) => sum + parseFloat(s.price.toString()),
-            0
-          );
-
-          const deposit = parseFloat(
-            depositAmount || process.env.DEPOSIT_AMOUNT || 100
-          );
-
-          const now = new Date();
-
-          const appointment = {
-            date: normalizedDate,
-            time: normalizedTime,
-            userId,
-            employeeId: empId,
-            serviceIds: svcIds,
-            totalPrice: Decimal128.fromString(totalPrice.toFixed(2)),
-            status: 'booked',
-            paymentStatus: 'deposit_paid',
-            contactNumber: contactNumber || '',
-            yocoCheckoutId: checkoutId,
-            createdAt: now,
-            updatedAt: now,
-          };
-
-          const apptResult = await db.collection('APPOINTMENTS')
-            .insertOne(appointment);
-
-          await db.collection('PAYMENTS').insertOne({
-            appointmentId: apptResult.insertedId,
-            type: 'deposit',
-            amount: Decimal128.fromString(deposit.toFixed(2)),
-            method: 'online',
-            status: 'paid',
-            yocoCheckoutId: checkoutId,
-            yocoPaymentId: event.payload?.id,
-            paidAt: now,
-            createdAt: now,
-          });
-
-          logger.info('Webhook: appointment created', {
-            appointmentId: apptResult.insertedId,
-            checkoutId,
-          });
-
-        } else if (event.type === 'payment.failed') {
-          logger.info('payment.failed', {
-            checkoutId: event.payload?.id
-          });
-
-        } else if (event.type === 'checkout.cancelled') {
-          logger.info('checkout.cancelled', {
-            checkoutId: event.payload?.id
-          });
-
-        } else {
-          logger.info('Unhandled event type', {
-            type: event.type
-          });
+          logger.error('Yoco webhook processing error', { error: err.message, stack: err.stack });
         }
-
-      } catch (err) {
-        if (err.code === 11000) {
-          logger.info('Duplicate appointment (safe)');
-          return;
-        }
-
-        logger.error('Webhook error', {
-          error: err.message,
-          stack: err.stack
-        });
-      }
+      });
     });
-  }
-);
 
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
