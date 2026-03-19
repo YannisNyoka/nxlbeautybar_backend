@@ -127,18 +127,6 @@ function generateSlotRange(startTime, totalMinutes) {
   return slots;
 }
 
-// ---- PayFast signature helper ----
-function generatePayFastSignature(data, passphrase = '') {
-  let str = Object.keys(data)
-    .filter(k => data[k] !== '' && data[k] !== null && data[k] !== undefined)
-    .map(k => `${k}=${encodeURIComponent(String(data[k])).replace(/%20/g, '+')}`)
-    .join('&');
-  if (passphrase) {
-    str += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
-  }
-  return crypto.createHash('md5').update(str).digest('hex');
-}
-
 const app = express();
 const port = process.env.PORT;
 
@@ -1048,15 +1036,16 @@ async function startServer() {
     }
 
     // =====================
-    // PAYFAST PAYMENT ROUTES
+    // YOCO PAYMENT ROUTES
     // =====================
 
+    // Create a Yoco checkout session — frontend redirects user to Yoco's hosted payment page
     app.post('/payments', authenticateToken, async (req, res, next) => {
       try {
-        const { appointmentId, amount, type } = req.body;
+        const { appointmentId } = req.body;
 
-        if (!appointmentId || !amount) {
-          return res.status(400).json({ success: false, error: 'appointmentId and amount are required' });
+        if (!appointmentId) {
+          return res.status(400).json({ success: false, error: 'appointmentId is required' });
         }
 
         let apptId;
@@ -1066,128 +1055,188 @@ async function startServer() {
         const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
         if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
+        // Block if already paid
         const existing = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
         if (existing && existing.status === 'paid') {
           return res.status(409).json({ success: false, error: 'Appointment already paid' });
         }
 
-        const isSandbox = process.env.PAYFAST_SANDBOX === 'true';
         const frontendUrl = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
-        const backendUrl = process.env.BACKEND_URL || 'https://nxlbeautybar.co.za';
-        const pfHost = isSandbox ? 'sandbox.payfast.co.za' : 'www.payfast.co.za';
+        const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
 
-        const user = await db.collection('USERS').findOne(
-          { _id: new ObjectId(req.user.userId) },
-          { projection: { password: 0 } }
-        );
+        // Yoco requires amount in CENTS (rands x 100)
+        const amountInCents = Math.round(depositAmount * 100);
 
-        const parsedAmount = parseFloat(amount).toFixed(2);
-        const paymentType = type || (parseFloat(amount) < decimalToNumber(appt.totalPrice) ? 'deposit' : 'full');
+        logger.info('Yoco: creating checkout session', { appointmentId, amountInCents });
 
-        const pfData = {
-          merchant_id: process.env.PAYFAST_MERCHANT_ID,
-          merchant_key: process.env.PAYFAST_MERCHANT_KEY,
-          return_url: `${frontendUrl}/payment-success?appointmentId=${appointmentId}`,
-          cancel_url: `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
-          notify_url: `${backendUrl}/api/payments/webhook`,
-          name_first: (user?.firstName || 'Customer').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
-          name_last: (user?.lastName || '').trim().replace(/[^a-zA-Z0-9 ]/g, ''),
-          email_address: user?.email || '',
-          m_payment_id: appointmentId,
-          amount: parsedAmount,
-          item_name: 'NXL Beauty Bar Booking Fee',
-        };
+        // Create Yoco checkout session via their REST API
+        const yocoResponse = await fetch('https://payments.yoco.com/api/checkouts', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.YOCO_SECRET_KEY}`,
+          },
+          body: JSON.stringify({
+            amount:     amountInCents,
+            currency:   'ZAR',
+            successUrl: `${frontendUrl}/payment-success?appointmentId=${appointmentId}`,
+            cancelUrl:  `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
+            failureUrl: `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
+            metadata: {
+              appointmentId: appointmentId,
+            },
+          }),
+        });
 
-        pfData.signature = generatePayFastSignature(pfData, process.env.PAYFAST_PASSPHRASE);
+        if (!yocoResponse.ok) {
+          const errBody = await yocoResponse.json().catch(() => ({}));
+          logger.error('Yoco checkout creation failed', { status: yocoResponse.status, body: errBody });
+          return res.status(500).json({ success: false, error: 'Could not create Yoco payment session. Please try again.' });
+        }
 
-        // FIX: Use $setOnInsert for createdAt so it is never overwritten on retry
-        // This preserves the original creation time so cleanup works correctly
+        const yocoData = await yocoResponse.json();
+
+        logger.info('Yoco: checkout session created', {
+          appointmentId,
+          checkoutId:  yocoData.id,
+          redirectUrl: yocoData.redirectUrl,
+        });
+
+        // Save pending payment record — $setOnInsert ensures createdAt is never overwritten on retry
         await db.collection('PAYMENTS').updateOne(
-          { appointmentId: apptId, type: paymentType },
+          { appointmentId: apptId, type: 'deposit' },
           {
             $set: {
-              appointmentId: apptId,
-              type: paymentType,
-              amount: Decimal128.fromString(parsedAmount),
-              method: 'online',
-              status: 'pending',
+              appointmentId:  apptId,
+              type:           'deposit',
+              amount:         Decimal128.fromString(depositAmount.toFixed(2)),
+              method:         'online',
+              status:         'pending',
+              yocoCheckoutId: yocoData.id,
             },
             $setOnInsert: {
-              createdAt: new Date(), // Only set on first insert, never overwritten on retry
+              createdAt: new Date(),
             }
           },
           { upsert: true }
         );
 
         return res.json({
-          success: true,
-          pfUrl: `https://${pfHost}/eng/process`,
-          pfData,
+          success:     true,
+          checkoutUrl: yocoData.redirectUrl, // frontend does: window.location.href = result.checkoutUrl
+          checkoutId:  yocoData.id,
         });
 
       } catch (err) {
-        console.error('PayFast init error:', err);
+        logger.error('Yoco payment init error:', err);
         next(err);
       }
     });
 
-    // FIX: Read payment BEFORE updating it so nextPaymentStatus is always correct
-    app.post('/payments/webhook', express.urlencoded({ extended: false }), async (req, res) => {
-      try {
-        const pfData = { ...req.body };
-        const receivedSig = pfData.signature;
-        delete pfData.signature;
+    // Yoco webhook — receives payment.succeeded / payment.failed / checkout.cancelled
+    // Yoco sends JSON. We respond 200 immediately then process async.
+    app.post('/payments/webhook', express.json(), (req, res) => {
+      // Respond 200 immediately so Yoco never marks the webhook as failed
+      res.status(200).send('OK');
 
-        const expectedSig = generatePayFastSignature(pfData, process.env.PAYFAST_PASSPHRASE);
-        if (receivedSig !== expectedSig) {
-          console.error('PayFast ITN: signature mismatch');
-          return res.status(400).send('Invalid signature');
-        }
+      setImmediate(async () => {
+        try {
+          const event = req.body;
 
-        const appointmentId = pfData.m_payment_id;
-        let apptId;
-        try { apptId = new ObjectId(appointmentId); }
-        catch { return res.status(400).send('Invalid appointment ID'); }
+          logger.info('Yoco webhook received', {
+            type:          event.type,
+            appointmentId: event.payload?.metadata?.appointmentId,
+            payloadId:     event.payload?.id,
+          });
 
-        if (pfData.payment_status === 'COMPLETE') {
-          // FIX: Read payment type BEFORE updating status
-          // This guarantees nextPaymentStatus is always correct
-          const payment = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
-          const nextPaymentStatus = payment?.type === 'deposit' ? 'deposit_paid' : 'paid';
+          if (!event || !event.type) {
+            logger.error('Yoco webhook: empty or malformed body');
+            return;
+          }
 
-          // Now update payment to paid
-          await db.collection('PAYMENTS').updateOne(
-            { appointmentId: apptId },
-            {
-              $set: {
-                status: 'paid',
-                payfastPaymentId: pfData.pf_payment_id,
-                paidAt: new Date(),
-              }
+          // Verify webhook secret if YOCO_WEBHOOK_SECRET is set in Render env vars
+          // Get this value from your Yoco dashboard -> Developer -> Webhooks
+          const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
+          if (webhookSecret) {
+            const receivedSig = req.headers['x-yoco-signature'];
+            if (!receivedSig) {
+              logger.error('Yoco webhook: missing x-yoco-signature header');
+              return;
             }
-          );
+            const expectedSig = crypto
+              .createHmac('sha256', webhookSecret)
+              .update(JSON.stringify(event))
+              .digest('hex');
+            if (receivedSig !== expectedSig) {
+              logger.error('Yoco webhook: signature mismatch', { received: receivedSig, expected: expectedSig });
+              return;
+            }
+            logger.info('Yoco webhook: signature verified');
+          } else {
+            logger.warn('Yoco webhook: YOCO_WEBHOOK_SECRET not set — skipping signature check. Set this in Render env vars.');
+          }
 
-          // Update appointment with correct paymentStatus and mark as booked
-          await db.collection('APPOINTMENTS').updateOne(
-            { _id: apptId },
-            { $set: { paymentStatus: nextPaymentStatus, status: 'booked', updatedAt: new Date() } }
-          );
+          if (event.type === 'payment.succeeded') {
+            const appointmentId = event.payload?.metadata?.appointmentId;
 
-          logger.info(`PayFast payment confirmed for appointment ${appointmentId}`);
+            if (!appointmentId) {
+              logger.error('Yoco webhook: payment.succeeded but no appointmentId in metadata', { payload: event.payload });
+              return;
+            }
 
-        } else if (pfData.payment_status === 'CANCELLED') {
-          await db.collection('PAYMENTS').updateOne(
-            { appointmentId: apptId },
-            { $set: { status: 'pending' } }
-          );
-          logger.info(`PayFast payment cancelled for appointment ${appointmentId}`);
+            let apptId;
+            try { apptId = new ObjectId(appointmentId); }
+            catch { logger.error('Yoco webhook: invalid appointmentId', { appointmentId }); return; }
+
+            logger.info('Yoco webhook: processing payment.succeeded', { appointmentId });
+
+            // Update payment to paid
+            await db.collection('PAYMENTS').updateOne(
+              { appointmentId: apptId },
+              {
+                $set: {
+                  status:        'paid',
+                  yocoPaymentId: event.payload?.id,
+                  paidAt:        new Date(),
+                }
+              }
+            );
+
+            // Mark appointment as booked with deposit paid
+            await db.collection('APPOINTMENTS').updateOne(
+              { _id: apptId },
+              {
+                $set: {
+                  paymentStatus: 'deposit_paid',
+                  status:        'booked',
+                  updatedAt:     new Date(),
+                }
+              }
+            );
+
+            logger.info('Yoco webhook: appointment successfully booked', { appointmentId });
+
+          } else if (event.type === 'payment.failed') {
+            const appointmentId = event.payload?.metadata?.appointmentId;
+            logger.info('Yoco webhook: payment.failed', { appointmentId });
+            // Payment stays pending — user can retry from the app
+
+          } else if (event.type === 'checkout.cancelled') {
+            const appointmentId = event.payload?.metadata?.appointmentId;
+            logger.info('Yoco webhook: checkout.cancelled', { appointmentId });
+            // Payment stays pending — user can retry from the app
+
+          } else {
+            logger.info('Yoco webhook: unhandled event type', { type: event.type });
+          }
+
+        } catch (err) {
+          logger.error('Yoco webhook processing error', {
+            error: err.message,
+            stack: err.stack,
+          });
         }
-
-        return res.status(200).send('OK');
-      } catch (err) {
-        console.error('PayFast webhook error:', err);
-        return res.status(500).send('Error');
-      }
+      });
     });
 
     crudRoutes('APPOINTMENTS', 'appointments');
@@ -1307,41 +1356,42 @@ async function startServer() {
     });
 
     // =====================
-    // CLEANUP: Delete unpaid appointments older than 30 minutes
-    // Uses paymentStatus: 'unpaid' as single source of truth
-    // Paid appointments always have deposit_paid or paid — never unpaid
-    // $setOnInsert ensures createdAt is never reset on payment retries
+    // CLEANUP: Delete unpaid appointments older than 24 hours
+    // paymentStatus: 'unpaid' is the single source of truth.
+    // Paid appointments always have deposit_paid or paid — never unpaid.
+    // Admin can also manually delete unpaid appointments from the dashboard.
     // =====================
     async function cleanupPendingAppointments() {
-  try {
-    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      try {
+        const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    const unpaidAppointments = await db.collection('APPOINTMENTS').find({
-      paymentStatus: 'unpaid',
-      createdAt: { $lt: twentyFourHoursAgo }
-    }).toArray();
+        const unpaidAppointments = await db.collection('APPOINTMENTS').find({
+          paymentStatus: 'unpaid',
+          createdAt: { $lt: twentyFourHoursAgo }
+        }).toArray();
 
-    if (unpaidAppointments.length > 0) {
-      const unpaidIds = unpaidAppointments.map(a => a._id);
+        if (unpaidAppointments.length > 0) {
+          const unpaidIds = unpaidAppointments.map(a => a._id);
 
-      const apptResult = await db.collection('APPOINTMENTS').deleteMany({
-        _id: { $in: unpaidIds }
-      });
+          const apptResult = await db.collection('APPOINTMENTS').deleteMany({
+            _id: { $in: unpaidIds }
+          });
 
-      const payResult = await db.collection('PAYMENTS').deleteMany({
-        appointmentId: { $in: unpaidIds }
-      });
+          const payResult = await db.collection('PAYMENTS').deleteMany({
+            appointmentId: { $in: unpaidIds }
+          });
 
-      logger.info(`Auto-cleaned ${apptResult.deletedCount} abandoned unpaid appointments older than 24 hours`);
+          logger.info(`Auto-cleaned ${apptResult.deletedCount} abandoned unpaid appointments older than 24 hours and ${payResult.deletedCount} associated payment records`);
+        }
+      } catch (err) {
+        logger.error('Cleanup job error:', err);
+      }
     }
-  } catch (err) {
-    logger.error('Cleanup job error:', err);
-  }
-}
 
-// Run once every 6 hours — no need to run frequently at 24h threshold
-setInterval(cleanupPendingAppointments, 6 * 60 * 60 * 1000);
-cleanupPendingAppointments();
+    // Run once every 6 hours — no need to run more frequently at a 24h threshold
+    setInterval(cleanupPendingAppointments, 6 * 60 * 60 * 1000);
+    cleanupPendingAppointments();
+
     app.listen(port, () => {
       console.log(`Server is running on port: ${port}`);
     });
