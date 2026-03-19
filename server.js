@@ -202,11 +202,24 @@ app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
+// Strip /api prefix FIRST so all subsequent middleware sees clean paths.
+// e.g. /api/payments/webhook → /payments/webhook
+// This must run before the body parser so req.path is correct.
+app.use((req, _res, next) => {
+  if (req.url.startsWith('/api/')) {
+    req.url = req.url.slice(4);
+  } else if (req.url === '/api') {
+    req.url = '/';
+  }
+  next();
+});
+
 // For the Yoco webhook: capture raw body bytes BEFORE any parsing.
 // Signature verification must run against the exact bytes Yoco sent —
 // parsing to JSON then re-stringifying can change whitespace/key order
 // and break the HMAC. req.rawBody stores the original buffer.
 // All other routes use bodyParser.json() as normal.
+// NOTE: req.path is now correct because the /api prefix was already stripped above.
 app.use((req, res, next) => {
   if (req.path === '/payments/webhook') {
     const chunks = [];
@@ -224,15 +237,6 @@ app.use((req, res, next) => {
   } else {
     bodyParser.json()(req, res, next);
   }
-});
-
-app.use((req, _res, next) => {
-  if (req.url.startsWith('/api/')) {
-    req.url = req.url.slice(4);
-  } else if (req.url === '/api') {
-    req.url = '/';
-  }
-  next();
 });
 
 // Rate limiter for auth routes
@@ -1157,7 +1161,54 @@ async function startServer() {
       }
     });
 
-        // Webhook: raw body is already captured by the middleware above (req.rawBody).
+    // POST /payments/verify — called by PaymentSuccess page after Yoco redirects back.
+    // Marks the appointment as booked + deposit_paid using the appointmentId.
+    // Idempotent — safe to call multiple times. The webhook does the same thing
+    // so whichever runs first wins, and the other is a no-op.
+    app.post('/payments/verify', authenticateToken, async (req, res, next) => {
+      try {
+        const { appointmentId } = req.body;
+        if (!appointmentId) {
+          return res.status(400).json({ success: false, error: 'appointmentId is required' });
+        }
+
+        let apptId;
+        try { apptId = new ObjectId(appointmentId); }
+        catch { return res.status(400).json({ success: false, error: 'Invalid appointmentId' }); }
+
+        const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
+        if (!appt) {
+          return res.status(404).json({ success: false, error: 'Appointment not found' });
+        }
+
+        // Already booked — idempotent success
+        if (appt.status === 'booked' && appt.paymentStatus === 'deposit_paid') {
+          logger.info('payments/verify: already booked', { appointmentId });
+          return res.json({ success: true, alreadyConfirmed: true });
+        }
+
+        // Update appointment to booked + deposit_paid
+        await db.collection('APPOINTMENTS').updateOne(
+          { _id: apptId },
+          { $set: { status: 'booked', paymentStatus: 'deposit_paid', updatedAt: new Date() } }
+        );
+
+        // Update payment record to paid if it exists
+        await db.collection('PAYMENTS').updateOne(
+          { appointmentId: apptId, status: { $ne: 'paid' } },
+          { $set: { status: 'paid', paidAt: new Date(), updatedAt: new Date() } }
+        );
+
+        logger.info('payments/verify: appointment confirmed', { appointmentId });
+        return res.json({ success: true });
+
+      } catch (err) {
+        logger.error('payments/verify error:', err);
+        next(err);
+      }
+    });
+
+    // Webhook: raw body is already captured by the middleware above (req.rawBody).
     // No express.json() here — body was parsed from rawBody in the middleware.
     app.post('/payments/webhook', (req, res) => {
       res.status(200).send('OK');
