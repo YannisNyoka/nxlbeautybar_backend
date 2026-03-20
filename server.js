@@ -1240,57 +1240,54 @@ async function startServer() {
           // Yoco delivers webhooks via Svix. Svix uses svix-signature header.
           // x-yoco-signature is a legacy header — check both.
           // We log all signature-related headers to help debug mismatches.
-          const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
-          const svixSig       = req.headers['svix-signature'];
-          const svixTimestamp = req.headers['svix-timestamp'];
-          const svixId        = req.headers['svix-id'];
-          const yocoSig       = req.headers['x-yoco-signature'];
+          // Yoco uses Svix with 'webhook-' prefixed headers (not 'svix-')
+          // Confirmed from live logs: webhook-signature, webhook-timestamp, webhook-id
+          const webhookSecret  = process.env.YOCO_WEBHOOK_SECRET;
+          const wSig           = req.headers['webhook-signature']  || req.headers['svix-signature'];
+          const wTimestamp     = req.headers['webhook-timestamp']  || req.headers['svix-timestamp'];
+          const wId            = req.headers['webhook-id']         || req.headers['svix-id'];
+          const yocoSig        = req.headers['x-yoco-signature'];
 
           logger.info('Yoco webhook: signature headers', {
-            svixSig:       svixSig ? svixSig.substring(0, 30) + '...' : null,
-            svixTimestamp,
-            svixId,
-            yocoSig:       yocoSig ? yocoSig.substring(0, 20) + '...' : null,
+            wSig:      wSig      ? wSig.substring(0, 30) + '...' : null,
+            wId,
+            wTimestamp,
+            yocoSig:   yocoSig  ? yocoSig.substring(0, 20) + '...' : null,
           });
 
           if (webhookSecret) {
-            if (svixSig && svixTimestamp && svixId) {
-              // Svix signature: HMAC-SHA256 of "id.timestamp.body" signed with base64-decoded secret
+            if (wSig && wTimestamp && wId) {
+              // Svix signature: HMAC-SHA256 of "id.timestamp.rawBody"
+              // signed with base64-decoded whsec_ secret
               if (!req.rawBody) {
-                logger.warn('Yoco webhook: rawBody missing — skipping Svix sig check, processing anyway');
+                logger.warn('Yoco webhook: rawBody missing — skipping sig check, processing anyway');
               } else {
-                const toSign = `${svixId}.${svixTimestamp}.${req.rawBody.toString('utf8')}`;
+                const toSign = `${wId}.${wTimestamp}.${req.rawBody.toString('utf8')}`;
                 const secretBytes = Buffer.from(
-                  webhookSecret.startsWith('whsec_')
-                    ? webhookSecret.slice(6)
-                    : webhookSecret,
+                  webhookSecret.startsWith('whsec_') ? webhookSecret.slice(6) : webhookSecret,
                   'base64'
                 );
                 const expected = crypto.createHmac('sha256', secretBytes).update(toSign).digest('base64');
-                // svix-signature can contain multiple space-separated "v1,<sig>" values
-                const matched = svixSig.split(' ').some(part => {
+                const matched = wSig.split(' ').some(part => {
                   const [, sigB64] = part.split(',');
                   return sigB64 === expected;
                 });
                 if (matched) {
-                  logger.info('Yoco webhook: Svix signature verified OK');
+                  logger.info('Yoco webhook: signature verified OK');
                 } else {
-                  logger.error('Yoco webhook: Svix signature mismatch — processing anyway to avoid lost payment', { svixId });
+                  logger.error('Yoco webhook: signature mismatch — processing anyway to avoid lost payment', { wId });
                 }
               }
             } else if (yocoSig) {
-              // Legacy x-yoco-signature: plain HMAC-SHA256 hex
               if (req.rawBody) {
                 const expected = crypto.createHmac('sha256', webhookSecret).update(req.rawBody).digest('hex');
                 if (yocoSig === expected) {
                   logger.info('Yoco webhook: x-yoco-signature verified OK');
                 } else {
-                  logger.error('Yoco webhook: x-yoco-signature mismatch — processing anyway', { yocoSig });
+                  logger.error('Yoco webhook: x-yoco-signature mismatch — processing anyway');
                 }
               }
             } else {
-              // No signature header at all — still process to avoid losing real payments
-              // This can happen on Svix test deliveries
               logger.warn('Yoco webhook: no signature header found — processing anyway', {
                 allHeaders: Object.keys(req.headers).join(', ')
               });
@@ -1347,9 +1344,11 @@ async function startServer() {
               logger.warn('Yoco webhook: no amount in event — skipping amount check', { event });
             }
 
-            // ✅ Update payment record — match by appointmentId + checkoutId for precision
+            // ✅ Update payment record — match by appointmentId only
+            // checkoutId from the event is a paymentId (p_xxx), not the checkout ID (ch_xxx)
+            // stored in yocoCheckoutId. Match by appointmentId to be safe.
             const paymentResult = await db.collection('PAYMENTS').updateOne(
-              { appointmentId: apptId, yocoCheckoutId: checkoutId },
+              { appointmentId: apptId },
               {
                 $set: {
                   status:        'paid',
