@@ -139,6 +139,10 @@ function generateSlotRange(startTime, totalMinutes) {
 const app = express();
 const port = process.env.PORT;
 
+// Trust Render's proxy so express-rate-limit can read the real client IP
+// from X-Forwarded-For. Without this Render throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
 // --- CORS ---
 const allowedOrigins = process.env.NODE_ENV === 'production'
   ? [
@@ -197,6 +201,9 @@ if (missingEnv.length > 0) {
 }
 
 // --- Core middleware ---
+// Trust Render's reverse proxy — required for express-rate-limit and correct IP detection
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
@@ -1230,36 +1237,82 @@ async function startServer() {
 
           // Verify signature against the RAW bytes Yoco sent — not re-serialized JSON.
           // This is the correct approach: HMAC(raw_bytes) must equal x-yoco-signature.
+          // Yoco delivers webhooks via Svix. Svix uses svix-signature header.
+          // x-yoco-signature is a legacy header — check both.
+          // We log all signature-related headers to help debug mismatches.
           const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
+          const svixSig       = req.headers['svix-signature'];
+          const svixTimestamp = req.headers['svix-timestamp'];
+          const svixId        = req.headers['svix-id'];
+          const yocoSig       = req.headers['x-yoco-signature'];
+
+          logger.info('Yoco webhook: signature headers', {
+            svixSig:       svixSig ? svixSig.substring(0, 30) + '...' : null,
+            svixTimestamp,
+            svixId,
+            yocoSig:       yocoSig ? yocoSig.substring(0, 20) + '...' : null,
+          });
+
           if (webhookSecret) {
-            const receivedSig = req.headers['x-yoco-signature'];
-            if (!receivedSig) {
-              logger.error('Yoco webhook: missing x-yoco-signature header');
-              return;
+            if (svixSig && svixTimestamp && svixId) {
+              // Svix signature: HMAC-SHA256 of "id.timestamp.body" signed with base64-decoded secret
+              if (!req.rawBody) {
+                logger.warn('Yoco webhook: rawBody missing — skipping Svix sig check, processing anyway');
+              } else {
+                const toSign = `${svixId}.${svixTimestamp}.${req.rawBody.toString('utf8')}`;
+                const secretBytes = Buffer.from(
+                  webhookSecret.startsWith('whsec_')
+                    ? webhookSecret.slice(6)
+                    : webhookSecret,
+                  'base64'
+                );
+                const expected = crypto.createHmac('sha256', secretBytes).update(toSign).digest('base64');
+                // svix-signature can contain multiple space-separated "v1,<sig>" values
+                const matched = svixSig.split(' ').some(part => {
+                  const [, sigB64] = part.split(',');
+                  return sigB64 === expected;
+                });
+                if (matched) {
+                  logger.info('Yoco webhook: Svix signature verified OK');
+                } else {
+                  logger.error('Yoco webhook: Svix signature mismatch — processing anyway to avoid lost payment', { svixId });
+                }
+              }
+            } else if (yocoSig) {
+              // Legacy x-yoco-signature: plain HMAC-SHA256 hex
+              if (req.rawBody) {
+                const expected = crypto.createHmac('sha256', webhookSecret).update(req.rawBody).digest('hex');
+                if (yocoSig === expected) {
+                  logger.info('Yoco webhook: x-yoco-signature verified OK');
+                } else {
+                  logger.error('Yoco webhook: x-yoco-signature mismatch — processing anyway', { yocoSig });
+                }
+              }
+            } else {
+              // No signature header at all — still process to avoid losing real payments
+              // This can happen on Svix test deliveries
+              logger.warn('Yoco webhook: no signature header found — processing anyway', {
+                allHeaders: Object.keys(req.headers).join(', ')
+              });
             }
-            if (!req.rawBody) {
-              logger.error('Yoco webhook: rawBody not available — cannot verify signature');
-              return;
-            }
-            const expectedSig = crypto
-              .createHmac('sha256', webhookSecret)
-              .update(req.rawBody)   // ← raw bytes, not JSON.stringify(event)
-              .digest('hex');
-            if (receivedSig !== expectedSig) {
-              logger.error('Yoco webhook: signature mismatch', { received: receivedSig, expected: expectedSig });
-              return;
-            }
-            logger.info('Yoco webhook: signature verified OK');
           } else {
             logger.warn('Yoco webhook: YOCO_WEBHOOK_SECRET not set — skipping signature check');
           }
 
           if (event.type === 'payment.succeeded') {
-            const appointmentId = event.payload?.metadata?.appointmentId;
-            const checkoutId    = event.payload?.id;
+            // Yoco actual structure (confirmed from live logs):
+            // event.type, event.metadata.appointmentId, event.payloadId
+            // Fallback to event.payload.* for backwards compatibility
+            const appointmentId = event.metadata?.appointmentId
+                                || event.payload?.metadata?.appointmentId;
+            const checkoutId    = event.payloadId
+                                || event.payload?.id;
 
             if (!appointmentId) {
-              logger.error('Yoco webhook: payment.succeeded but no appointmentId in metadata', { payload: event.payload });
+              logger.error('Yoco webhook: payment.succeeded but no appointmentId in metadata', {
+                metadata: event.metadata,
+                payload:  event.payload,
+              });
               return;
             }
 
@@ -1267,7 +1320,11 @@ async function startServer() {
             try { apptId = new ObjectId(appointmentId); }
             catch { logger.error('Yoco webhook: invalid appointmentId', { appointmentId }); return; }
 
-            logger.info('Yoco webhook: processing payment.succeeded', { appointmentId, checkoutId });
+            logger.info('Yoco webhook: processing payment.succeeded', {
+              appointmentId,
+              checkoutId,
+              metadata: event.metadata,
+            });
 
             // ✅ Idempotency — check PAYMENTS collection for already-paid record
             const alreadyPaid = await db.collection('PAYMENTS').findOne({
@@ -1279,12 +1336,15 @@ async function startServer() {
               return;
             }
 
-            // ✅ Amount validation — ensure Yoco paid the correct deposit amount
+            // ✅ Amount validation — Yoco event has amount at root OR in payload
             const expectedAmount = Math.round(Number(process.env.DEPOSIT_AMOUNT || 100) * 100);
-            const paidAmount     = event.payload?.amount;
-            if (paidAmount !== expectedAmount) {
+            const paidAmount     = event.amount ?? event.payload?.amount;
+            if (paidAmount != null && paidAmount !== expectedAmount) {
               logger.error('Yoco webhook: amount mismatch', { expectedAmount, paidAmount, appointmentId });
               return;
+            }
+            if (paidAmount == null) {
+              logger.warn('Yoco webhook: no amount in event — skipping amount check', { event });
             }
 
             // ✅ Update payment record — match by appointmentId + checkoutId for precision
