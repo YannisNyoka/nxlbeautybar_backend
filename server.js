@@ -380,7 +380,7 @@ const initCollections = async (db) => {
           employeeId: { bsonType: 'objectId' },
           serviceIds: { bsonType: 'array', minItems: 1, items: { bsonType: 'objectId' } },
           totalPrice: { bsonType: 'decimal', minimum: 0 },
-          status: { bsonType: 'string', enum: ['pending', 'booked', 'cancelled', 'completed'] },
+          status: { bsonType: 'string', enum: ['pending', 'booked', 'cancelled', 'completed', 'no-show'] },
           paymentStatus: { bsonType: 'string', enum: ['unpaid', 'deposit_paid', 'paid'] },
           createdAt: { bsonType: 'date' },
           updatedAt: { bsonType: 'date' }
@@ -843,6 +843,18 @@ async function startServer() {
           req.body.status = 'pending';
           if (req.user?.userId) req.body.userId = new ObjectId(req.user.userId);
           req.body.paymentStatus = 'unpaid';
+
+          // Keep userName on the document — it IS used by the admin dashboard.
+          // Strip fields that are NOT in the APPOINTMENTS schema to avoid
+          // MongoDB strict validation errors (code 121).
+          // contactNumber, stylist, manicureType, pedicureType are booking-form
+          // fields that don't belong in the appointment record itself.
+          delete req.body.totalDuration;   // computed from services, not stored
+          delete req.body.contactNumber;   // stored on USER record
+          delete req.body.stylist;         // use employeeId instead
+          delete req.body.manicureType;    // service sub-type, not in schema
+          delete req.body.pedicureType;    // service sub-type, not in schema
+          // NOTE: userName is kept — it is used by GET /appointments to display client name
         }
 
         if (collectionName === 'PAYMENTS') {
@@ -935,10 +947,11 @@ async function startServer() {
           if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
           const validTransitions = {
-            pending: ['booked', 'cancelled'],
-            booked: ['cancelled', 'completed'],
+            pending:  ['booked', 'cancelled'],
+            booked:   ['cancelled', 'completed', 'no-show'],
             cancelled: [],
-            completed: []
+            completed: [],
+            'no-show': [],
           };
           if (req.body.status && !validTransitions[appt.status]?.includes(req.body.status)) {
             return res.status(400).json({ success: false, error: 'Invalid status transition' });
@@ -1113,6 +1126,20 @@ async function startServer() {
 
         logger.info('Yoco: creating checkout session', { appointmentId, amountInCents });
 
+        // Snapshot the appointment details into Yoco metadata.
+        // If the appointment is deleted before payment succeeds (e.g. admin cleanup),
+        // the webhook can use this snapshot to recreate it.
+        const apptSnapshot = {
+          appointmentId,
+          date:        appt.date,
+          time:        appt.time,
+          userId:      String(appt.userId),
+          employeeId:  String(appt.employeeId),
+          serviceIds:  (appt.serviceIds || []).map(String),
+          totalPrice:  String(appt.totalPrice),
+          userName:    appt.userName || '',
+        };
+
         const yocoResponse = await fetchFn('https://payments.yoco.com/api/checkouts', {
           method: 'POST',
           headers: {
@@ -1125,7 +1152,7 @@ async function startServer() {
             successUrl: `${frontendUrl}/payment-success?appointmentId=${appointmentId}`,
             cancelUrl:  `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
             failureUrl: `${frontendUrl}/payment-cancel?appointmentId=${appointmentId}`,
-            metadata: { appointmentId },
+            metadata:   apptSnapshot,
           }),
         });
 
@@ -1139,22 +1166,46 @@ async function startServer() {
 
         logger.info('Yoco: checkout session created', { appointmentId, checkoutId: yocoData.id });
 
-        // Save pending payment record
-        await db.collection('PAYMENTS').updateOne(
-          { appointmentId: apptId, type: 'deposit' },
-          {
-            $set: {
-              appointmentId:  apptId,
-              type:           'deposit',
-              amount:         Decimal128.fromString(depositAmount.toFixed(2)),
-              method:         'online',
-              status:         'pending',
-              yocoCheckoutId: yocoData.id,
+        // Save pending payment record — if this fails, webhook will self-heal via upsert
+        try {
+          const payUpsertResult = await db.collection('PAYMENTS').updateOne(
+            { appointmentId: apptId, type: 'deposit' },
+            {
+              $set: {
+                appointmentId:   apptId,
+                type:            'deposit',
+                amount:          Decimal128.fromString(depositAmount.toFixed(2)),
+                method:          'online',
+                status:          'pending',
+                yocoCheckoutId:  yocoData.id,
+                updatedAt:       new Date(),
+                // Snapshot so webhook can recover if appointment was deleted
+                apptSnapshot: {
+                  date:       appt.date,
+                  time:       appt.time,
+                  userId:     appt.userId,
+                  employeeId: appt.employeeId,
+                  serviceIds: appt.serviceIds,
+                  totalPrice: appt.totalPrice,
+                  userName:   appt.userName || '',
+                },
+              },
+              $setOnInsert: { createdAt: new Date() }
             },
-            $setOnInsert: { createdAt: new Date() }
-          },
-          { upsert: true }
-        );
+            { upsert: true }
+          );
+          logger.info('Yoco: pending payment record saved', {
+            appointmentId,
+            matched: payUpsertResult.matchedCount,
+            upserted: payUpsertResult.upsertedCount,
+          });
+        } catch (payErr) {
+          // Log but don't block redirect — webhook self-heals via upsert on payment.succeeded
+          logger.error('Yoco: FAILED to save pending payment record (webhook will self-heal)', {
+            appointmentId,
+            error: payErr.message,
+          });
+        }
 
         return res.json({
           success:     true,
@@ -1313,6 +1364,10 @@ async function startServer() {
               return;
             }
 
+            logger.info('Yoco webhook: appointmentId extracted', {
+              appointmentId,
+              source: event.metadata?.appointmentId ? 'event.metadata' : 'event.payload.metadata',
+            });
             let apptId;
             try { apptId = new ObjectId(appointmentId); }
             catch { logger.error('Yoco webhook: invalid appointmentId', { appointmentId }); return; }
@@ -1320,7 +1375,9 @@ async function startServer() {
             logger.info('Yoco webhook: processing payment.succeeded', {
               appointmentId,
               checkoutId,
-              metadata: event.metadata,
+              metadata:  event.metadata,
+              // Log full event structure once to help debug future issues
+              eventKeys: Object.keys(event),
             });
 
             // ✅ Idempotency — check PAYMENTS collection for already-paid record
@@ -1344,9 +1401,10 @@ async function startServer() {
               logger.warn('Yoco webhook: no amount in event — skipping amount check', { event });
             }
 
-            // ✅ Update payment record — match by appointmentId only
-            // checkoutId from the event is a paymentId (p_xxx), not the checkout ID (ch_xxx)
-            // stored in yocoCheckoutId. Match by appointmentId to be safe.
+            // ✅ Upsert payment record — create it if POST /payments race-lost or failed
+            // checkoutId from the event is a paymentId (p_xxx). Use upsert so the
+            // webhook is self-healing even if the pending record was never saved.
+            const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
             const paymentResult = await db.collection('PAYMENTS').updateOne(
               { appointmentId: apptId },
               {
@@ -1355,16 +1413,29 @@ async function startServer() {
                   yocoPaymentId: checkoutId,
                   paidAt:        new Date(),
                   updatedAt:     new Date(),
-                }
-              }
+                },
+                $setOnInsert: {
+                  appointmentId: apptId,
+                  type:          'deposit',
+                  amount:        Decimal128.fromString(depositAmount.toFixed(2)),
+                  method:        'online',
+                  createdAt:     new Date(),
+                },
+              },
+              { upsert: true }
             );
 
-            if (paymentResult.matchedCount === 0) {
-              logger.error('Yoco webhook: CRITICAL — payment record not found', { appointmentId, checkoutId });
-              // Still attempt appointment update so the booking isn't lost
+            if (paymentResult.matchedCount === 0 && paymentResult.upsertedCount === 0) {
+              logger.error('Yoco webhook: CRITICAL — payment upsert failed completely', { appointmentId, checkoutId });
+            } else if (paymentResult.upsertedCount > 0) {
+              logger.warn('Yoco webhook: payment record was missing — created by webhook (race condition or POST /payments failed)', { appointmentId, checkoutId });
+            } else {
+              logger.info('Yoco webhook: payment record updated to paid', { appointmentId });
             }
 
             // ✅ Update appointment to booked + deposit_paid
+            // If it was deleted (e.g. admin removed it before payment came through),
+            // recreate it from the snapshot stored in the PAYMENTS record.
             const apptResult = await db.collection('APPOINTMENTS').updateOne(
               { _id: apptId },
               {
@@ -1377,11 +1448,58 @@ async function startServer() {
             );
 
             if (apptResult.matchedCount === 0) {
-              logger.error('Yoco webhook: CRITICAL — appointment not found after payment', { appointmentId, checkoutId });
-              return;
-            }
+              logger.warn('Yoco webhook: appointment not found — attempting recovery from payment snapshot', {
+                appointmentId, checkoutId,
+              });
 
-            logger.info('Yoco webhook: appointment successfully booked', { appointmentId });
+              // Try to get the snapshot from the PAYMENTS record we just upserted
+              const payRecord = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
+              const snap = payRecord?.apptSnapshot
+                        || event.metadata  // also stored in Yoco metadata
+                        || event.payload?.metadata;
+
+              if (snap && snap.date && snap.time && snap.userId && snap.employeeId && snap.serviceIds) {
+                try {
+                  // Recreate the appointment as already-booked and paid
+                  await db.collection('APPOINTMENTS').updateOne(
+                    { _id: apptId },
+                    {
+                      $set: {
+                        _id:           apptId,
+                        date:          snap.date,
+                        time:          snap.time,
+                        userId:        typeof snap.userId === 'string' ? new ObjectId(snap.userId) : snap.userId,
+                        employeeId:    typeof snap.employeeId === 'string' ? new ObjectId(snap.employeeId) : snap.employeeId,
+                        serviceIds:    (snap.serviceIds || []).map(id => typeof id === 'string' ? new ObjectId(id) : id),
+                        totalPrice:    typeof snap.totalPrice === 'string' ? Decimal128.fromString(snap.totalPrice) : snap.totalPrice,
+                        userName:      snap.userName || '',
+                        status:        'booked',
+                        paymentStatus: 'deposit_paid',
+                        createdAt:     new Date(),
+                        updatedAt:     new Date(),
+                      }
+                    },
+                    { upsert: true }
+                  );
+                  logger.info('Yoco webhook: appointment recreated from snapshot — booking confirmed', {
+                    appointmentId, date: snap.date, time: snap.time,
+                  });
+                } catch (recreateErr) {
+                  logger.error('Yoco webhook: CRITICAL — failed to recreate appointment from snapshot', {
+                    appointmentId, checkoutId,
+                    error: recreateErr.message,
+                    hint: `Payment IS recorded as paid. Manually insert appointment: date=${snap.date}, time=${snap.time}`,
+                  });
+                }
+              } else {
+                logger.error('Yoco webhook: CRITICAL — appointment deleted and no snapshot available for recovery', {
+                  appointmentId, checkoutId,
+                  hint: 'Payment IS recorded as paid. Check PAYMENTS collection and manually create the appointment.',
+                });
+              }
+            } else {
+              logger.info('Yoco webhook: appointment successfully booked', { appointmentId });
+            }
 
           } else if (event.type === 'payment.failed') {
             logger.info('Yoco webhook: payment.failed', { checkoutId: event.payload?.id });
@@ -1556,6 +1674,17 @@ async function startServer() {
     // Run once every 6 hours — no need to run more frequently at a 24h threshold
     setInterval(cleanupPendingAppointments, 6 * 60 * 60 * 1000);
     cleanupPendingAppointments();
+
+    // Keep Render free instance alive by pinging itself every 4 minutes.
+    // Render spins down free instances after 15 minutes of inactivity.
+    if (process.env.NODE_ENV === 'production' && process.env.BACKEND_URL) {
+      setInterval(() => {
+        fetchFn(`${process.env.BACKEND_URL}/`)
+          .then(() => logger.info('Keep-alive ping sent'))
+          .catch(err => logger.warn('Keep-alive ping failed:', err.message));
+      }, 4 * 60 * 1000);
+      logger.info('Keep-alive ping scheduled every 4 minutes');
+    }
 
     app.listen(port, () => {
       console.log(`Server is running on port: ${port}`);
