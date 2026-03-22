@@ -390,10 +390,19 @@ const initCollections = async (db) => {
     validationLevel: 'strict'
   }).catch(() => {});
   try { await db.collection('APPOINTMENTS').dropIndex('date_1_time_1_employeeId_1'); } catch (e) {}
-  await db.collection('APPOINTMENTS').createIndex(
-    { date: 1, time: 1, employeeId: 1 },
-    { unique: true, name: 'appointment_unique_idx' }
-  );
+     // Drop old unique index first, then recreate as partial
+try { await db.collection('APPOINTMENTS').dropIndex('appointment_unique_idx'); } catch (e) {}
+await db.collection('APPOINTMENTS').createIndex(
+  { date: 1, time: 1, employeeId: 1 },
+  {
+    unique: true,
+    name: 'appointment_unique_idx',
+    partialFilterExpression: {
+      status: { $in: ['booked', 'completed', 'no-show'] },
+      paymentStatus: { $in: ['deposit_paid', 'paid'] }
+    }
+  }
+);
 
   // PAYMENTS
   await db.createCollection('PAYMENTS', {
@@ -823,13 +832,16 @@ async function startServer() {
           const totalDuration = services.reduce((sum, s) => sum + s.durationMinutes, 0);
           const requestedSlots = generateSlotRange(req.body.time, totalDuration);
 
-          const overlapping = await db.collection('APPOINTMENTS').findOne({
-            date: req.body.date,
-            employeeId: req.body.employeeId,
-            time: { $in: requestedSlots },
-            status: { $nin: ['cancelled'] }
-          });
-          if (overlapping) return res.status(400).json({ success: false, error: 'This appointment overlaps with an existing booking' });
+              const overlapping = await db.collection('APPOINTMENTS').findOne({
+  date: req.body.date,
+  employeeId: req.body.employeeId,
+  time: { $in: requestedSlots },
+  status: { $nin: ['cancelled', 'pending'] },
+  paymentStatus: { $nin: ['unpaid'] }
+});
+
+
+if (overlapping) return res.status(400).json({ success: false, error: 'This appointment overlaps with an existing booking' });
 
           const blocked = await db.collection('AVAILABILITY').findOne({
             date: req.body.date,
