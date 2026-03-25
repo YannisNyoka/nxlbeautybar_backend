@@ -222,11 +222,7 @@ app.use((req, _res, next) => {
 });
 
 // For the Yoco webhook: capture raw body bytes BEFORE any parsing.
-// Signature verification must run against the exact bytes Yoco sent —
-// parsing to JSON then re-stringifying can change whitespace/key order
-// and break the HMAC. req.rawBody stores the original buffer.
-// All other routes use bodyParser.json() as normal.
-// NOTE: req.path is now correct because the /api prefix was already stripped above.
+
 app.use((req, res, next) => {
   if (req.path === '/payments/webhook') {
     const chunks = [];
@@ -1533,6 +1529,47 @@ if (overlapping) return res.status(400).json({ success: false, error: 'This appo
         }
       });
     });
+
+    // REPLACE WITH — also move this ABOVE the crudRoutes() calls:
+app.post('/appointments/check-availability', authenticateToken, async (req, res) => {
+  try {
+    const { date, time, employeeId, appointmentId } = req.body;
+    if (!date || !time) {
+      return res.status(400).json({ success: false, error: 'date and time are required' });
+    }
+
+    const query = {
+      date,
+      status: { $nin: ['cancelled', 'pending'] },
+      paymentStatus: { $in: ['deposit_paid', 'paid'] },
+    };
+
+    // If employeeId provided, check that specific employee only
+    if (employeeId) {
+      try { query.employeeId = new ObjectId(employeeId); } catch {}
+    }
+
+    // Exclude the appointment being checked (so user's own appt doesn't block itself)
+    if (appointmentId) {
+      try { query._id = { $ne: new ObjectId(appointmentId) }; } catch {}
+    }
+
+    // Normalize time to 24h for comparison
+    const time24 = normalizeTimeTo24h(time) || time;
+    query.time = time24;
+
+    const existing = await db.collection('APPOINTMENTS').findOne(query);
+
+    return res.json({
+      success: true,
+      available: !existing,
+      message: existing ? 'This time slot has been taken by another client.' : 'Available',
+    });
+  } catch (err) {
+    logger.error('check-availability error:', err);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
 
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
