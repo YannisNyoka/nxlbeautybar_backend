@@ -849,7 +849,26 @@ if (overlapping) return res.status(400).json({ success: false, error: 'This appo
           const totalPrice = services.reduce((sum, s) => sum + parseFloat(s.price), 0);
           req.body.totalPrice = Decimal128.fromString(totalPrice.toFixed(2));
           req.body.status = (req.body.paymentStatus === 'paid' || req.body.paymentStatus === 'deposit_paid') ? 'booked' : 'pending';
-          if (req.user?.userId) req.body.userId = new ObjectId(req.user.userId);
+
+// If admin provided a userId (booking on behalf of client), use that.
+// Otherwise fall back to the logged-in user's own ID.
+if (req.body.userId) {
+  req.body.userId = new ObjectId(req.body.userId);
+} else if (req.user?.userId) {
+  req.body.userId = new ObjectId(req.user.userId);
+}
+
+// Set userName from the client record so it appears in the appointment
+// and shows up correctly in the client's profile view.
+if (req.body.userId) {
+  const clientUser = await db.collection('USERS').findOne(
+    { _id: req.body.userId },
+    { projection: { firstName: 1, lastName: 1 } }
+  );
+  if (clientUser) {
+    req.body.userName = `${clientUser.firstName} ${clientUser.lastName}`;
+  }
+}
           
           // Allow admin to set initial payment status (useful for cash payments)
 if (req.body.paymentStatus && !['unpaid', 'deposit_paid', 'paid'].includes(req.body.paymentStatus)) {
