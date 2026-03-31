@@ -848,9 +848,18 @@ if (overlapping) return res.status(400).json({ success: false, error: 'This appo
 
           const totalPrice = services.reduce((sum, s) => sum + parseFloat(s.price), 0);
           req.body.totalPrice = Decimal128.fromString(totalPrice.toFixed(2));
-          req.body.status = 'pending';
+          req.body.status = (req.body.paymentStatus === 'paid' || req.body.paymentStatus === 'deposit_paid') ? 'booked' : 'pending';
           if (req.user?.userId) req.body.userId = new ObjectId(req.user.userId);
-          req.body.paymentStatus = 'unpaid';
+          
+          // Allow admin to set initial payment status (useful for cash payments)
+if (req.body.paymentStatus && !['unpaid', 'deposit_paid', 'paid'].includes(req.body.paymentStatus)) {
+  return res.status(400).json({ success: false, error: 'Invalid paymentStatus' });
+}
+
+req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
+
+// If admin marks it as paid at creation time, create a PAYMENT record automatically (especially for cash)
+
 
           // Keep userName on the document — it IS used by the admin dashboard.
           // Strip fields that are NOT in the APPOINTMENTS schema to avoid
@@ -892,8 +901,23 @@ if (overlapping) return res.status(400).json({ success: false, error: 'This appo
         }
 
         try {
-          const result = await db.collection(collectionName).insertOne(req.body);
-          if (!result.insertedId) return res.status(500).json({ success: false, error: 'Failed to create document' });
+  const result = await db.collection(collectionName).insertOne(req.body);
+  if (!result.insertedId) return res.status(500).json({ success: false, error: 'Failed to create document' });
+
+  // Admin cash/card payment: create PAYMENT record now that we have insertedId
+  if (collectionName === 'APPOINTMENTS' && req.body.paymentStatus === 'paid' && req.body.paymentMethod) {
+    const apptServices = await db.collection('SERVICES').find({ _id: { $in: req.body.serviceIds } }).toArray();
+    const totalPrice = apptServices.reduce((sum, s) => sum + parseFloat(s.price.toString()), 0);
+    await db.collection('PAYMENTS').insertOne({
+      appointmentId: result.insertedId,
+      type: 'full',
+      amount: Decimal128.fromString(totalPrice.toFixed(2)),
+      method: req.body.paymentMethod,
+      status: 'paid',
+      currency: 'ZAR',
+      createdAt: new Date(),
+    });
+  }
 
           if (collectionName === 'PAYMENTS') {
             const nextStatus = req.body.type === 'deposit' ? 'deposit_paid' : 'paid';
@@ -965,6 +989,34 @@ if (overlapping) return res.status(400).json({ success: false, error: 'This appo
             return res.status(400).json({ success: false, error: 'Invalid status transition' });
           }
 
+          if (req.body.paymentStatus) {
+  if (!['unpaid', 'deposit_paid', 'paid'].includes(req.body.paymentStatus)) {
+    return res.status(400).json({ success: false, error: 'Invalid paymentStatus' });
+  }
+
+  // Optional: If changing to 'paid' and no payment record exists, you could auto-create one here (cash)
+  if (req.body.paymentStatus === 'paid' && req.body.paymentMethod) {
+    const existingPayment = await db.collection('PAYMENTS').findOne({ 
+      appointmentId: new ObjectId(req.params.id), 
+      type: 'full' 
+    });
+
+    if (!existingPayment) {
+      // Create cash payment record
+      const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
+      await db.collection('PAYMENTS').insertOne({
+        appointmentId: new ObjectId(req.params.id),
+        type: 'full',
+        amount: appt.totalPrice,
+        method: req.body.paymentMethod || 'cash',
+        status: 'paid',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
+  }
+}
+
           if (req.body.serviceIds) {
             const count = await db.collection('SERVICES').countDocuments({ _id: { $in: req.body.serviceIds }, isActive: true });
             if (count !== req.body.serviceIds.length) {
@@ -975,6 +1027,7 @@ if (overlapping) return res.status(400).json({ success: false, error: 'This appo
               services.reduce((sum, s) => sum + parseFloat(s.price), 0).toFixed(2)
             );
           }
+          
         }
 
         if (collectionName === 'PAYMENTS') {
