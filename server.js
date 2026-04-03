@@ -1702,6 +1702,45 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
     });
 
     // =====================
+// NOTIFICATIONS ENDPOINTS
+// =====================
+app.post('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+  try {
+    const { message, target = 'staff' } = req.body;
+    if (!message) return res.status(400).json({ success: false, error: 'Message is required' });
+    const notification = {
+      message,
+      target,
+      recipientId: null,
+      createdBy: new ObjectId(req.user.userId),
+      createdAt: new Date(),
+      read: false,
+      readAt: null,
+    };
+    const result = await db.collection('NOTIFICATIONS').insertOne(notification);
+    res.status(201).json({ success: true, data: { _id: result.insertedId, ...notification } });
+  } catch (err) { next(err); }
+});
+
+app.get('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+  try {
+    const notifications = await db.collection('NOTIFICATIONS')
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .toArray();
+    res.status(200).json({ success: true, data: notifications });
+  } catch (err) { next(err); }
+});
+
+app.delete('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+  try {
+    await db.collection('NOTIFICATIONS').deleteMany({});
+    res.status(200).json({ success: true, message: 'All notifications cleared' });
+  } catch (err) { next(err); }
+});
+
+    // =====================
     // SWAGGER
     // =====================
     const swaggerDocument = {
