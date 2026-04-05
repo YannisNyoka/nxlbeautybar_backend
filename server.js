@@ -465,6 +465,10 @@ await db.collection('APPOINTMENTS').createIndex(
     },
     validationLevel: 'strict'
   }).catch(() => {});
+
+  // GALLERY
+await db.createCollection('GALLERY').catch(() => {});
+await db.collection('GALLERY').createIndex({ createdAt: -1 });
 };
 
 // --- Start server ---
@@ -1737,6 +1741,44 @@ app.delete('/notifications', authenticateToken, authorizeRole('admin'), async (r
   try {
     await db.collection('NOTIFICATIONS').deleteMany({});
     res.status(200).json({ success: true, message: 'All notifications cleared' });
+  } catch (err) { next(err); }
+});
+
+// =====================
+// GALLERY ENDPOINTS
+// =====================
+app.post('/gallery', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+  try {
+    const { imageUrl, clientName, caption } = req.body;
+    if (!imageUrl) return res.status(400).json({ success: false, error: 'imageUrl is required' });
+    const item = {
+      imageUrl,
+      clientName: clientName || '',
+      caption: caption || '',
+      createdBy: new ObjectId(req.user.userId),
+      createdAt: new Date(),
+    };
+    const result = await db.collection('GALLERY').insertOne(item);
+    res.status(201).json({ success: true, data: { _id: result.insertedId, ...item } });
+  } catch (err) { next(err); }
+});
+
+app.get('/gallery', async (req, res, next) => {
+  try {
+    const items = await db.collection('GALLERY')
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .toArray();
+    res.status(200).json({ success: true, data: items });
+  } catch (err) { next(err); }
+});
+
+app.delete('/gallery/:id', authenticateToken, authorizeRole('admin'), idValidator, async (req, res, next) => {
+  try {
+    const result = await db.collection('GALLERY').deleteOne({ _id: new ObjectId(req.params.id) });
+    if (result.deletedCount === 0) return res.status(404).json({ success: false, error: 'Item not found' });
+    res.status(200).json({ success: true, message: 'Deleted successfully' });
   } catch (err) { next(err); }
 });
 
