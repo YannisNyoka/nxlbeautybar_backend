@@ -123,11 +123,11 @@ function normalizeAppointmentDateTime(dateRaw, timeRaw) {
 function generateSlotRange(startTime, totalMinutes) {
   const slots = [];
   let [h, m] = startTime.split(':').map(Number);
-  const count = Math.ceil(totalMinutes / 15);
+  const count = Math.ceil(totalMinutes / 30);
 
   for (let i = 0; i < count; i++) {
     slots.push(`${pad2(h)}:${pad2(m)}`);
-    m += 15;
+    m += 30;
     if (m >= 60) {
       m = 0;
       h += 1;
