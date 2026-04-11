@@ -201,7 +201,6 @@ if (missingEnv.length > 0) {
 }
 
 // --- Core middleware ---
-// Trust Render's reverse proxy — required for express-rate-limit and correct IP detection
 app.set('trust proxy', 1);
 
 app.use(helmet());
@@ -210,8 +209,6 @@ app.options(/.*/, cors(corsOptions));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // Strip /api prefix FIRST so all subsequent middleware sees clean paths.
-// e.g. /api/payments/webhook → /payments/webhook
-// This must run before the body parser so req.path is correct.
 app.use((req, _res, next) => {
   if (req.url.startsWith('/api/')) {
     req.url = req.url.slice(4);
@@ -222,7 +219,6 @@ app.use((req, _res, next) => {
 });
 
 // For the Yoco webhook: capture raw body bytes BEFORE any parsing.
-
 app.use((req, res, next) => {
   if (req.path === '/payments/webhook') {
     const chunks = [];
@@ -386,19 +382,18 @@ const initCollections = async (db) => {
     validationLevel: 'strict'
   }).catch(() => {});
   try { await db.collection('APPOINTMENTS').dropIndex('date_1_time_1_employeeId_1'); } catch (e) {}
-     // Drop old unique index first, then recreate as partial
-try { await db.collection('APPOINTMENTS').dropIndex('appointment_unique_idx'); } catch (e) {}
-await db.collection('APPOINTMENTS').createIndex(
-  { date: 1, time: 1, employeeId: 1 },
-  {
-    unique: true,
-    name: 'appointment_unique_idx',
-    partialFilterExpression: {
-      status: { $in: ['booked', 'completed', 'no-show'] },
-      paymentStatus: { $in: ['deposit_paid', 'paid'] }
+  try { await db.collection('APPOINTMENTS').dropIndex('appointment_unique_idx'); } catch (e) {}
+  await db.collection('APPOINTMENTS').createIndex(
+    { date: 1, time: 1, employeeId: 1 },
+    {
+      unique: true,
+      name: 'appointment_unique_idx',
+      partialFilterExpression: {
+        status: { $in: ['booked', 'completed', 'no-show'] },
+        paymentStatus: { $in: ['deposit_paid', 'paid'] }
+      }
     }
-  }
-);
+  );
 
   // PAYMENTS
   await db.createCollection('PAYMENTS', {
@@ -467,8 +462,8 @@ await db.collection('APPOINTMENTS').createIndex(
   }).catch(() => {});
 
   // GALLERY
-await db.createCollection('GALLERY').catch(() => {});
-await db.collection('GALLERY').createIndex({ createdAt: -1 });
+  await db.createCollection('GALLERY').catch(() => {});
+  await db.collection('GALLERY').createIndex({ createdAt: -1 });
 };
 
 // --- Start server ---
@@ -832,16 +827,15 @@ async function startServer() {
           const totalDuration = services.reduce((sum, s) => sum + s.durationMinutes, 0);
           const requestedSlots = generateSlotRange(req.body.time, totalDuration);
 
-              const overlapping = await db.collection('APPOINTMENTS').findOne({
-  date: req.body.date,
-  employeeId: req.body.employeeId,
-  time: { $in: requestedSlots },
-  status: { $nin: ['cancelled', 'pending'] },
-  paymentStatus: { $nin: ['unpaid'] }
-});
+          const overlapping = await db.collection('APPOINTMENTS').findOne({
+            date: req.body.date,
+            employeeId: req.body.employeeId,
+            time: { $in: requestedSlots },
+            status: { $nin: ['cancelled', 'pending'] },
+            paymentStatus: { $nin: ['unpaid'] }
+          });
 
-
-if (overlapping) return res.status(400).json({ success: false, error: 'This appointment overlaps with an existing booking' });
+          if (overlapping) return res.status(400).json({ success: false, error: 'This appointment overlaps with an existing booking' });
 
           const blocked = await db.collection('AVAILABILITY').findOne({
             date: req.body.date,
@@ -854,47 +848,33 @@ if (overlapping) return res.status(400).json({ success: false, error: 'This appo
           req.body.totalPrice = Decimal128.fromString(totalPrice.toFixed(2));
           req.body.status = (req.body.paymentStatus === 'paid' || req.body.paymentStatus === 'deposit_paid') ? 'booked' : 'pending';
 
-// If admin provided a userId (booking on behalf of client), use that.
-// Otherwise fall back to the logged-in user's own ID.
-if (req.body.userId) {
-  req.body.userId = new ObjectId(req.body.userId);
-} else if (req.user?.userId) {
-  req.body.userId = new ObjectId(req.user.userId);
-}
+          if (req.body.userId) {
+            req.body.userId = new ObjectId(req.body.userId);
+          } else if (req.user?.userId) {
+            req.body.userId = new ObjectId(req.user.userId);
+          }
 
-// Set userName from the client record so it appears in the appointment
-// and shows up correctly in the client's profile view.
-if (req.body.userId) {
-  const clientUser = await db.collection('USERS').findOne(
-    { _id: req.body.userId },
-    { projection: { firstName: 1, lastName: 1 } }
-  );
-  if (clientUser) {
-    req.body.userName = `${clientUser.firstName} ${clientUser.lastName}`;
-  }
-}
-          
-          // Allow admin to set initial payment status (useful for cash payments)
-if (req.body.paymentStatus && !['unpaid', 'deposit_paid', 'paid'].includes(req.body.paymentStatus)) {
-  return res.status(400).json({ success: false, error: 'Invalid paymentStatus' });
-}
+          if (req.body.userId) {
+            const clientUser = await db.collection('USERS').findOne(
+              { _id: req.body.userId },
+              { projection: { firstName: 1, lastName: 1 } }
+            );
+            if (clientUser) {
+              req.body.userName = `${clientUser.firstName} ${clientUser.lastName}`;
+            }
+          }
 
-req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
+          if (req.body.paymentStatus && !['unpaid', 'deposit_paid', 'paid'].includes(req.body.paymentStatus)) {
+            return res.status(400).json({ success: false, error: 'Invalid paymentStatus' });
+          }
 
-// If admin marks it as paid at creation time, create a PAYMENT record automatically (especially for cash)
+          req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
 
-
-          // Keep userName on the document — it IS used by the admin dashboard.
-          // Strip fields that are NOT in the APPOINTMENTS schema to avoid
-          // MongoDB strict validation errors (code 121).
-          // contactNumber, stylist, manicureType, pedicureType are booking-form
-          // fields that don't belong in the appointment record itself.
-          delete req.body.totalDuration;   // computed from services, not stored
-          delete req.body.contactNumber;   // stored on USER record
-          delete req.body.stylist;         // use employeeId instead
-          delete req.body.manicureType;    // service sub-type, not in schema
-          delete req.body.pedicureType;    // service sub-type, not in schema
-          // NOTE: userName is kept — it is used by GET /appointments to display client name
+          delete req.body.totalDuration;
+          delete req.body.contactNumber;
+          delete req.body.stylist;
+          delete req.body.manicureType;
+          delete req.body.pedicureType;
         }
 
         if (collectionName === 'PAYMENTS') {
@@ -924,23 +904,69 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
         }
 
         try {
-  const result = await db.collection(collectionName).insertOne(req.body);
-  if (!result.insertedId) return res.status(500).json({ success: false, error: 'Failed to create document' });
+          const result = await db.collection(collectionName).insertOne(req.body);
+          if (!result.insertedId) return res.status(500).json({ success: false, error: 'Failed to create document' });
 
-  // Admin cash/card payment: create PAYMENT record now that we have insertedId
-  if (collectionName === 'APPOINTMENTS' && req.body.paymentStatus === 'paid' && req.body.paymentMethod) {
-    const apptServices = await db.collection('SERVICES').find({ _id: { $in: req.body.serviceIds } }).toArray();
-    const totalPrice = apptServices.reduce((sum, s) => sum + parseFloat(s.price.toString()), 0);
-    await db.collection('PAYMENTS').insertOne({
-      appointmentId: result.insertedId,
-      type: 'full',
-      amount: Decimal128.fromString(totalPrice.toFixed(2)),
-      method: req.body.paymentMethod,
-      status: 'paid',
-      currency: 'ZAR',
-      createdAt: new Date(),
-    });
-  }
+          // Admin cash/card payment: create PAYMENT record now that we have insertedId
+          if (collectionName === 'APPOINTMENTS' && req.body.paymentStatus === 'paid' && req.body.paymentMethod) {
+            const apptServices = await db.collection('SERVICES').find({ _id: { $in: req.body.serviceIds } }).toArray();
+            const totalPrice = apptServices.reduce((sum, s) => sum + parseFloat(s.price.toString()), 0);
+            await db.collection('PAYMENTS').insertOne({
+              appointmentId: result.insertedId,
+              type: 'full',
+              amount: Decimal128.fromString(totalPrice.toFixed(2)),
+              method: req.body.paymentMethod,
+              status: 'paid',
+              currency: 'ZAR',
+              createdAt: new Date(),
+            });
+          }
+
+          // ─── NEW: Insert a booking notification so the admin is alerted ───────
+          // This fires for every new appointment (both client self-service and
+          // admin-created cash bookings). The notification is written to the DB
+          // and picked up by the 20-second poll running in AdminDashboard.
+          // We use a system ObjectId for createdBy when the booking comes from
+          // a regular client (req.user.role === 'user') since the NOTIFICATIONS
+          // schema requires a valid ObjectId in that field.
+          if (collectionName === 'APPOINTMENTS') {
+            try {
+              const serviceNames = (req.body.serviceIds || []).map(id => {
+                // services array is already fetched above inside the APPOINTMENTS block
+                // but we need to look it up again here in scope — re-query is safe,
+                // or we can rely on req.body.userName which is already set.
+                return null; // resolved below
+              });
+
+              // Re-fetch service names for the notification message
+              const bookedServices = await db.collection('SERVICES')
+                .find({ _id: { $in: req.body.serviceIds } })
+                .project({ name: 1 })
+                .toArray();
+              const svcNames = bookedServices.map(s => s.name).join(', ');
+
+              await db.collection('NOTIFICATIONS').insertOne({
+                message: `📅 New booking: ${req.body.userName || 'A client'} — ${svcNames} on ${req.body.date} at ${req.body.time}`,
+                target: 'staff',
+                recipientId: null,
+                createdBy: new ObjectId(req.user.userId),
+                createdAt: new Date(),
+                read: false,
+                readAt: null,
+              });
+
+              logger.info('Booking notification created', {
+                appointmentId: result.insertedId,
+                userName: req.body.userName,
+                date: req.body.date,
+                time: req.body.time,
+              });
+            } catch (notifErr) {
+              // Never let a notification failure block the booking response
+              logger.warn('Failed to create booking notification:', { error: notifErr.message });
+            }
+          }
+          // ─────────────────────────────────────────────────────────────────────
 
           if (collectionName === 'PAYMENTS') {
             const nextStatus = req.body.type === 'deposit' ? 'deposit_paid' : 'paid';
@@ -949,6 +975,7 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
               { $set: { paymentStatus: nextStatus, updatedAt: new Date() } }
             );
           }
+
           res.status(201).json({ success: true, message: 'Created', data: { _id: result.insertedId, ...req.body } });
         } catch (err) {
           if (err.code === 121) return res.status(400).json({ success: false, error: 'Schema validation failed', details: err.errInfo });
@@ -1013,32 +1040,30 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
           }
 
           if (req.body.paymentStatus) {
-  if (!['unpaid', 'deposit_paid', 'paid'].includes(req.body.paymentStatus)) {
-    return res.status(400).json({ success: false, error: 'Invalid paymentStatus' });
-  }
+            if (!['unpaid', 'deposit_paid', 'paid'].includes(req.body.paymentStatus)) {
+              return res.status(400).json({ success: false, error: 'Invalid paymentStatus' });
+            }
 
-  // Optional: If changing to 'paid' and no payment record exists, you could auto-create one here (cash)
-  if (req.body.paymentStatus === 'paid' && req.body.paymentMethod) {
-    const existingPayment = await db.collection('PAYMENTS').findOne({ 
-      appointmentId: new ObjectId(req.params.id), 
-      type: 'full' 
-    });
+            if (req.body.paymentStatus === 'paid' && req.body.paymentMethod) {
+              const existingPayment = await db.collection('PAYMENTS').findOne({
+                appointmentId: new ObjectId(req.params.id),
+                type: 'full'
+              });
 
-    if (!existingPayment) {
-      // Create cash payment record
-      const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
-      await db.collection('PAYMENTS').insertOne({
-        appointmentId: new ObjectId(req.params.id),
-        type: 'full',
-        amount: appt.totalPrice,
-        method: req.body.paymentMethod || 'cash',
-        status: 'paid',
-        createdAt: new Date(),
-        updatedAt: new Date()
-      });
-    }
-  }
-}
+              if (!existingPayment) {
+                const apptForPay = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
+                await db.collection('PAYMENTS').insertOne({
+                  appointmentId: new ObjectId(req.params.id),
+                  type: 'full',
+                  amount: apptForPay.totalPrice,
+                  method: req.body.paymentMethod || 'cash',
+                  status: 'paid',
+                  createdAt: new Date(),
+                  updatedAt: new Date()
+                });
+              }
+            }
+          }
 
           if (req.body.serviceIds) {
             const count = await db.collection('SERVICES').countDocuments({ _id: { $in: req.body.serviceIds }, isActive: true });
@@ -1050,7 +1075,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
               services.reduce((sum, s) => sum + parseFloat(s.price), 0).toFixed(2)
             );
           }
-          
         }
 
         if (collectionName === 'PAYMENTS') {
@@ -1178,11 +1202,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
     // =====================
     // YOCO PAYMENT ROUTES
     // =====================
-
-    // Create Yoco checkout session using existing appointmentId.
-    // Appointment already exists (created by BookingSummary).
-    // This route looks it up and creates a Yoco checkout for the deposit.
-    // After payment, webhook updates appointment to booked + deposit_paid.
     app.post('/payments', authenticateToken, async (req, res, next) => {
       try {
         const { appointmentId } = req.body;
@@ -1198,7 +1217,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
         const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
         if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
-        // Block if already paid
         const existing = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
         if (existing && existing.status === 'paid') {
           return res.status(409).json({ success: false, error: 'Appointment already paid' });
@@ -1210,9 +1228,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
 
         logger.info('Yoco: creating checkout session', { appointmentId, amountInCents });
 
-        // Snapshot the appointment details into Yoco metadata.
-        // If the appointment is deleted before payment succeeds (e.g. admin cleanup),
-        // the webhook can use this snapshot to recreate it.
         const apptSnapshot = {
           appointmentId,
           date:        appt.date,
@@ -1250,7 +1265,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
 
         logger.info('Yoco: checkout session created', { appointmentId, checkoutId: yocoData.id });
 
-        // Save pending payment record — if this fails, webhook will self-heal via upsert
         try {
           const payUpsertResult = await db.collection('PAYMENTS').updateOne(
             { appointmentId: apptId, type: 'deposit' },
@@ -1263,7 +1277,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
                 status:          'pending',
                 yocoCheckoutId:  yocoData.id,
                 updatedAt:       new Date(),
-                // Snapshot so webhook can recover if appointment was deleted
                 apptSnapshot: {
                   date:       appt.date,
                   time:       appt.time,
@@ -1284,7 +1297,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
             upserted: payUpsertResult.upsertedCount,
           });
         } catch (payErr) {
-          // Log but don't block redirect — webhook self-heals via upsert on payment.succeeded
           logger.error('Yoco: FAILED to save pending payment record (webhook will self-heal)', {
             appointmentId,
             error: payErr.message,
@@ -1303,10 +1315,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
       }
     });
 
-    // POST /payments/verify — called by PaymentSuccess page after Yoco redirects back.
-    // Marks the appointment as booked + deposit_paid using the appointmentId.
-    // Idempotent — safe to call multiple times. The webhook does the same thing
-    // so whichever runs first wins, and the other is a no-op.
     app.post('/payments/verify', authenticateToken, async (req, res, next) => {
       try {
         const { appointmentId } = req.body;
@@ -1323,19 +1331,16 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
           return res.status(404).json({ success: false, error: 'Appointment not found' });
         }
 
-        // Already booked — idempotent success
         if (appt.status === 'booked' && appt.paymentStatus === 'deposit_paid') {
           logger.info('payments/verify: already booked', { appointmentId });
           return res.json({ success: true, alreadyConfirmed: true });
         }
 
-        // Update appointment to booked + deposit_paid
         await db.collection('APPOINTMENTS').updateOne(
           { _id: apptId },
           { $set: { status: 'booked', paymentStatus: 'deposit_paid', updatedAt: new Date() } }
         );
 
-        // Update payment record to paid if it exists
         await db.collection('PAYMENTS').updateOne(
           { appointmentId: apptId, status: { $ne: 'paid' } },
           { $set: { status: 'paid', paidAt: new Date(), updatedAt: new Date() } }
@@ -1350,8 +1355,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
       }
     });
 
-    // Webhook: raw body is already captured by the middleware above (req.rawBody).
-    // No express.json() here — body was parsed from rawBody in the middleware.
     app.post('/payments/webhook', (req, res) => {
       res.status(200).send('OK');
 
@@ -1370,13 +1373,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
             return;
           }
 
-          // Verify signature against the RAW bytes Yoco sent — not re-serialized JSON.
-          // This is the correct approach: HMAC(raw_bytes) must equal x-yoco-signature.
-          // Yoco delivers webhooks via Svix. Svix uses svix-signature header.
-          // x-yoco-signature is a legacy header — check both.
-          // We log all signature-related headers to help debug mismatches.
-          // Yoco uses Svix with 'webhook-' prefixed headers (not 'svix-')
-          // Confirmed from live logs: webhook-signature, webhook-timestamp, webhook-id
           const webhookSecret  = process.env.YOCO_WEBHOOK_SECRET;
           const wSig           = req.headers['webhook-signature']  || req.headers['svix-signature'];
           const wTimestamp     = req.headers['webhook-timestamp']  || req.headers['svix-timestamp'];
@@ -1392,8 +1388,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
 
           if (webhookSecret) {
             if (wSig && wTimestamp && wId) {
-              // Svix signature: HMAC-SHA256 of "id.timestamp.rawBody"
-              // signed with base64-decoded whsec_ secret
               if (!req.rawBody) {
                 logger.warn('Yoco webhook: rawBody missing — skipping sig check, processing anyway');
               } else {
@@ -1432,9 +1426,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
           }
 
           if (event.type === 'payment.succeeded') {
-            // Yoco actual structure (confirmed from live logs):
-            // event.type, event.metadata.appointmentId, event.payloadId
-            // Fallback to event.payload.* for backwards compatibility
             const appointmentId = event.metadata?.appointmentId
                                 || event.payload?.metadata?.appointmentId;
             const checkoutId    = event.payloadId
@@ -1460,11 +1451,9 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
               appointmentId,
               checkoutId,
               metadata:  event.metadata,
-              // Log full event structure once to help debug future issues
               eventKeys: Object.keys(event),
             });
 
-            // ✅ Idempotency — check PAYMENTS collection for already-paid record
             const alreadyPaid = await db.collection('PAYMENTS').findOne({
               appointmentId: apptId,
               status: 'paid'
@@ -1474,7 +1463,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
               return;
             }
 
-            // ✅ Amount validation — Yoco event has amount at root OR in payload
             const expectedAmount = Math.round(Number(process.env.DEPOSIT_AMOUNT || 100) * 100);
             const paidAmount     = event.amount ?? event.payload?.amount;
             if (paidAmount != null && paidAmount !== expectedAmount) {
@@ -1485,9 +1473,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
               logger.warn('Yoco webhook: no amount in event — skipping amount check', { event });
             }
 
-            // ✅ Upsert payment record — create it if POST /payments race-lost or failed
-            // checkoutId from the event is a paymentId (p_xxx). Use upsert so the
-            // webhook is self-healing even if the pending record was never saved.
             const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
             const paymentResult = await db.collection('PAYMENTS').updateOne(
               { appointmentId: apptId },
@@ -1512,14 +1497,11 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
             if (paymentResult.matchedCount === 0 && paymentResult.upsertedCount === 0) {
               logger.error('Yoco webhook: CRITICAL — payment upsert failed completely', { appointmentId, checkoutId });
             } else if (paymentResult.upsertedCount > 0) {
-              logger.warn('Yoco webhook: payment record was missing — created by webhook (race condition or POST /payments failed)', { appointmentId, checkoutId });
+              logger.warn('Yoco webhook: payment record was missing — created by webhook', { appointmentId, checkoutId });
             } else {
               logger.info('Yoco webhook: payment record updated to paid', { appointmentId });
             }
 
-            // ✅ Update appointment to booked + deposit_paid
-            // If it was deleted (e.g. admin removed it before payment came through),
-            // recreate it from the snapshot stored in the PAYMENTS record.
             const apptResult = await db.collection('APPOINTMENTS').updateOne(
               { _id: apptId },
               {
@@ -1536,15 +1518,13 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
                 appointmentId, checkoutId,
               });
 
-              // Try to get the snapshot from the PAYMENTS record we just upserted
               const payRecord = await db.collection('PAYMENTS').findOne({ appointmentId: apptId });
               const snap = payRecord?.apptSnapshot
-                        || event.metadata  // also stored in Yoco metadata
+                        || event.metadata
                         || event.payload?.metadata;
 
               if (snap && snap.date && snap.time && snap.userId && snap.employeeId && snap.serviceIds) {
                 try {
-                  // Recreate the appointment as already-booked and paid
                   await db.collection('APPOINTMENTS').updateOne(
                     { _id: apptId },
                     {
@@ -1596,7 +1576,6 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
           }
 
         } catch (err) {
-          // Duplicate key = race condition, appointment already created — safe to ignore
           if (err.code === 11000) {
             logger.info('Yoco webhook: duplicate key — payment already processed.');
             return;
@@ -1606,46 +1585,42 @@ req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
       });
     });
 
-    // REPLACE WITH — also move this ABOVE the crudRoutes() calls:
-app.post('/appointments/check-availability', authenticateToken, async (req, res) => {
-  try {
-    const { date, time, employeeId, appointmentId } = req.body;
-    if (!date || !time) {
-      return res.status(400).json({ success: false, error: 'date and time are required' });
-    }
+    app.post('/appointments/check-availability', authenticateToken, async (req, res) => {
+      try {
+        const { date, time, employeeId, appointmentId } = req.body;
+        if (!date || !time) {
+          return res.status(400).json({ success: false, error: 'date and time are required' });
+        }
 
-    const query = {
-      date,
-      status: { $nin: ['cancelled', 'pending'] },
-      paymentStatus: { $in: ['deposit_paid', 'paid'] },
-    };
+        const query = {
+          date,
+          status: { $nin: ['cancelled', 'pending'] },
+          paymentStatus: { $in: ['deposit_paid', 'paid'] },
+        };
 
-    // If employeeId provided, check that specific employee only
-    if (employeeId) {
-      try { query.employeeId = new ObjectId(employeeId); } catch {}
-    }
+        if (employeeId) {
+          try { query.employeeId = new ObjectId(employeeId); } catch {}
+        }
 
-    // Exclude the appointment being checked (so user's own appt doesn't block itself)
-    if (appointmentId) {
-      try { query._id = { $ne: new ObjectId(appointmentId) }; } catch {}
-    }
+        if (appointmentId) {
+          try { query._id = { $ne: new ObjectId(appointmentId) }; } catch {}
+        }
 
-    // Normalize time to 24h for comparison
-    const time24 = normalizeTimeTo24h(time) || time;
-    query.time = time24;
+        const time24 = normalizeTimeTo24h(time) || time;
+        query.time = time24;
 
-    const existing = await db.collection('APPOINTMENTS').findOne(query);
+        const existing = await db.collection('APPOINTMENTS').findOne(query);
 
-    return res.json({
-      success: true,
-      available: !existing,
-      message: existing ? 'This time slot has been taken by another client.' : 'Available',
+        return res.json({
+          success: true,
+          available: !existing,
+          message: existing ? 'This time slot has been taken by another client.' : 'Available',
+        });
+      } catch (err) {
+        logger.error('check-availability error:', err);
+        res.status(500).json({ success: false, error: 'Server error' });
+      }
     });
-  } catch (err) {
-    logger.error('check-availability error:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
 
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
@@ -1706,81 +1681,95 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
     });
 
     // =====================
-// NOTIFICATIONS ENDPOINTS
-// =====================
-app.post('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
-  try {
-    const { message, target = 'staff' } = req.body;
-    if (!message) return res.status(400).json({ success: false, error: 'Message is required' });
-    const notification = {
-      message,
-      target,
-      recipientId: null,
-      createdBy: new ObjectId(req.user.userId),
-      createdAt: new Date(),
-      read: false,
-      readAt: null,
-    };
-    const result = await db.collection('NOTIFICATIONS').insertOne(notification);
-    res.status(201).json({ success: true, data: { _id: result.insertedId, ...notification } });
-  } catch (err) { next(err); }
-});
+    // NOTIFICATIONS ENDPOINTS
+    // =====================
+    app.post('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const { message, target = 'staff' } = req.body;
+        if (!message) return res.status(400).json({ success: false, error: 'Message is required' });
+        const notification = {
+          message,
+          target,
+          recipientId: null,
+          createdBy: new ObjectId(req.user.userId),
+          createdAt: new Date(),
+          read: false,
+          readAt: null,
+        };
+        const result = await db.collection('NOTIFICATIONS').insertOne(notification);
+        res.status(201).json({ success: true, data: { _id: result.insertedId, ...notification } });
+      } catch (err) { next(err); }
+    });
 
-app.get('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
-  try {
-    const notifications = await db.collection('NOTIFICATIONS')
-      .find({})
-      .sort({ createdAt: -1 })
-      .limit(200)
-      .toArray();
-    res.status(200).json({ success: true, data: notifications });
-  } catch (err) { next(err); }
-});
+    app.get('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const notifications = await db.collection('NOTIFICATIONS')
+          .find({})
+          .sort({ createdAt: -1 })
+          .limit(200)
+          .toArray();
+        res.status(200).json({ success: true, data: notifications });
+      } catch (err) { next(err); }
+    });
 
-app.delete('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
-  try {
-    await db.collection('NOTIFICATIONS').deleteMany({});
-    res.status(200).json({ success: true, message: 'All notifications cleared' });
-  } catch (err) { next(err); }
-});
+    app.delete('/notifications', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        await db.collection('NOTIFICATIONS').deleteMany({});
+        res.status(200).json({ success: true, message: 'All notifications cleared' });
+      } catch (err) { next(err); }
+    });
 
-// =====================
-// GALLERY ENDPOINTS
-// =====================
-app.post('/gallery', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
-  try {
-    const { imageUrl, clientName, caption } = req.body;
-    if (!imageUrl) return res.status(400).json({ success: false, error: 'imageUrl is required' });
-    const item = {
-      imageUrl,
-      clientName: clientName || '',
-      caption: caption || '',
-      createdBy: new ObjectId(req.user.userId),
-      createdAt: new Date(),
-    };
-    const result = await db.collection('GALLERY').insertOne(item);
-    res.status(201).json({ success: true, data: { _id: result.insertedId, ...item } });
-  } catch (err) { next(err); }
-});
+    // ─── NEW: Mark all notifications as read ─────────────────────────────────
+    // Called by AdminDashboard when the admin opens the Activity Log tab.
+    // Resets the unread badge count to zero.
+    app.post('/notifications/mark-read', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        await db.collection('NOTIFICATIONS').updateMany(
+          { read: false },
+          { $set: { read: true, readAt: new Date() } }
+        );
+        res.status(200).json({ success: true, message: 'All notifications marked as read' });
+      } catch (err) { next(err); }
+    });
+    // ─────────────────────────────────────────────────────────────────────────
 
-app.get('/gallery', async (req, res, next) => {
-  try {
-    const items = await db.collection('GALLERY')
-      .find({})
-      .sort({ createdAt: -1 })
-      .limit(20)
-      .toArray();
-    res.status(200).json({ success: true, data: items });
-  } catch (err) { next(err); }
-});
+    // =====================
+    // GALLERY ENDPOINTS
+    // =====================
+    app.post('/gallery', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const { imageUrl, clientName, caption } = req.body;
+        if (!imageUrl) return res.status(400).json({ success: false, error: 'imageUrl is required' });
+        const item = {
+          imageUrl,
+          clientName: clientName || '',
+          caption: caption || '',
+          createdBy: new ObjectId(req.user.userId),
+          createdAt: new Date(),
+        };
+        const result = await db.collection('GALLERY').insertOne(item);
+        res.status(201).json({ success: true, data: { _id: result.insertedId, ...item } });
+      } catch (err) { next(err); }
+    });
 
-app.delete('/gallery/:id', authenticateToken, authorizeRole('admin'), idValidator, async (req, res, next) => {
-  try {
-    const result = await db.collection('GALLERY').deleteOne({ _id: new ObjectId(req.params.id) });
-    if (result.deletedCount === 0) return res.status(404).json({ success: false, error: 'Item not found' });
-    res.status(200).json({ success: true, message: 'Deleted successfully' });
-  } catch (err) { next(err); }
-});
+    app.get('/gallery', async (req, res, next) => {
+      try {
+        const items = await db.collection('GALLERY')
+          .find({})
+          .sort({ createdAt: -1 })
+          .limit(20)
+          .toArray();
+        res.status(200).json({ success: true, data: items });
+      } catch (err) { next(err); }
+    });
+
+    app.delete('/gallery/:id', authenticateToken, authorizeRole('admin'), idValidator, async (req, res, next) => {
+      try {
+        const result = await db.collection('GALLERY').deleteOne({ _id: new ObjectId(req.params.id) });
+        if (result.deletedCount === 0) return res.status(404).json({ success: false, error: 'Item not found' });
+        res.status(200).json({ success: true, message: 'Deleted successfully' });
+      } catch (err) { next(err); }
+    });
 
     // =====================
     // SWAGGER
@@ -1842,9 +1831,6 @@ app.delete('/gallery/:id', authenticateToken, authorizeRole('admin'), idValidato
 
     // =====================
     // CLEANUP: Delete unpaid appointments older than 24 hours
-    // paymentStatus: 'unpaid' is the single source of truth.
-    // Paid appointments always have deposit_paid or paid — never unpaid.
-    // Admin can also manually delete unpaid appointments from the dashboard.
     // =====================
     async function cleanupPendingAppointments() {
       try {
@@ -1873,12 +1859,9 @@ app.delete('/gallery/:id', authenticateToken, authorizeRole('admin'), idValidato
       }
     }
 
-    // Run once every 6 hours — no need to run more frequently at a 24h threshold
     setInterval(cleanupPendingAppointments, 6 * 60 * 60 * 1000);
     cleanupPendingAppointments();
 
-    // Keep Render free instance alive by pinging itself every 4 minutes.
-    // Render spins down free instances after 15 minutes of inactivity.
     if (process.env.NODE_ENV === 'production' && process.env.BACKEND_URL) {
       setInterval(() => {
         fetchFn(`${process.env.BACKEND_URL}/`)
