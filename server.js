@@ -584,43 +584,129 @@ async function startServer() {
       }
     );
 
+    // ─────────────────────────────────────────────────────────────────────────────
+// In server.js, FIND this entire block (starts around line 490):
+//
+//   app.post('/auth/request-password-reset', authLimiter,
+//     body('email').isEmail().normalizeEmail(),
+//     async (req, res, next) => {
+//       ...
+//       if (process.env.NODE_ENV === 'production' && process.env.SMTP_HOST) {
+//         ...
+//       } else {
+//         logger.info(`Password reset token for ${req.body.email}: ${resetToken}`);
+//       }
+//       ...
+//     }
+//   );
+//
+// REPLACE it entirely with the block below.
+// ─────────────────────────────────────────────────────────────────────────────
+
     app.post('/auth/request-password-reset', authLimiter,
       body('email').isEmail().normalizeEmail(),
       async (req, res, next) => {
         try {
           const errors = validationResult(req);
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
-          const user = await db.collection('USERS').findOne({ email: req.body.email });
-          if (!user) return res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
 
-          const resetToken = jwt.sign({ userId: user._id, email: user.email, type: 'password-reset' }, jwtSecret, { expiresIn: '1h' });
+          const user = await db.collection('USERS').findOne({ email: req.body.email });
+
+          // Always return 200 to prevent user enumeration
+          if (!user) {
+            return res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
+          }
+
+          const resetToken = jwt.sign(
+            { userId: user._id, email: user.email, type: 'password-reset' },
+            jwtSecret,
+            { expiresIn: '1h' }
+          );
+
           await db.collection('USERS').updateOne(
             { _id: user._id },
             { $set: { passwordResetToken: resetToken, passwordResetExpiry: new Date(Date.now() + 3600000) } }
           );
 
-          if (process.env.NODE_ENV === 'production' && process.env.SMTP_HOST) {
-            const transporter = nodemailer.createTransport({
-              host: process.env.SMTP_HOST,
-              port: process.env.SMTP_PORT,
-              auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-            });
-            const resetUrl = `${process.env.CORS_ORIGIN}/reset-password?token=${resetToken}`;
-            await transporter.sendMail({
-              from: process.env.SMTP_USER,
-              to: req.body.email,
-              subject: 'Password Reset Request',
-              html: `<p>Click <a href="${resetUrl}">here</a> to reset your password. This link expires in 1 hour.</p>`
-            });
+          // Build the reset URL using CORS_ORIGIN so it always points to the
+          // correct frontend in both dev and production.
+          const frontendOrigin = (process.env.CORS_ORIGIN || 'http://localhost:5173').replace(/\/$/, '');
+          const resetUrl = `${frontendOrigin}/reset-password?token=${resetToken}`;
+
+          // Always log the reset URL — useful for testing and as a fallback.
+          logger.info(`[PASSWORD RESET] Reset URL for ${user.email}: ${resetUrl}`);
+
+          // Attempt to send email whenever SMTP credentials are present.
+          // Removed the NODE_ENV=production guard — this now works in dev too.
+          if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+            try {
+              const transporter = nodemailer.createTransport({
+                host:   process.env.SMTP_HOST,
+                port:   Number(process.env.SMTP_PORT) || 587,
+                secure: Number(process.env.SMTP_PORT) === 465,
+                auth: {
+                  user: process.env.SMTP_USER,
+                  pass: process.env.SMTP_PASS,
+                },
+              });
+
+              await transporter.sendMail({
+                from:    `"NXL Beauty Bar" <${process.env.SMTP_USER}>`,
+                to:      user.email,
+                subject: 'Reset Your NXL Beauty Bar Password',
+                html: `
+                  <div style="font-family:'DM Sans',Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
+                    <h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2>
+                    <h3 style="color:#6b3528;margin-top:0;">Password Reset Request</h3>
+                    <p style="color:#555;line-height:1.65;margin-bottom:1.5rem;">
+                      Hi ${user.firstName},<br/><br/>
+                      We received a request to reset the password for your account.
+                      Click the button below to choose a new password.
+                      This link expires in <strong>1 hour</strong>.
+                    </p>
+                    <div style="text-align:center;margin:2rem 0;">
+                      <a href="${resetUrl}"
+                        style="background:linear-gradient(135deg,#3d1f15,#a0502e);color:#ffe8d6;text-decoration:none;padding:0.85rem 2rem;border-radius:50px;font-weight:700;font-size:0.95rem;display:inline-block;">
+                        Reset My Password
+                      </a>
+                    </div>
+                    <p style="color:#9e7060;font-size:0.82rem;line-height:1.65;">
+                      If the button above doesn't work, copy and paste this link into your browser:<br/>
+                      <a href="${resetUrl}" style="color:#a0502e;word-break:break-all;">${resetUrl}</a>
+                    </p>
+                    <p style="color:#b08070;font-size:0.78rem;margin-top:1.5rem;">
+                      If you didn't request a password reset, you can safely ignore this email.
+                      Your password will not change.
+                    </p>
+                    <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
+                    <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">
+                      NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800
+                    </p>
+                  </div>
+                `,
+              });
+
+              logger.info(`[PASSWORD RESET] Email sent successfully to ${user.email}`);
+            } catch (emailErr) {
+              // Log the error but do NOT fail the request.
+              // The token is saved in the DB and the reset URL is logged above,
+              // so the user can still reset via the logged URL if email fails.
+              logger.error(`[PASSWORD RESET] nodemailer error for ${user.email}: ${emailErr.message}`);
+            }
           } else {
-            logger.info(`Password reset token for ${req.body.email}: ${resetToken}`);
+            logger.warn(
+              '[PASSWORD RESET] SMTP not configured (SMTP_HOST / SMTP_USER / SMTP_PASS missing). ' +
+              'Email not sent. Copy the reset URL from the log line above and open it in your browser.'
+            );
           }
 
-          res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
-        } catch (err) { next(err); }
+          return res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
+        } catch (err) {
+          next(err);
+        }
       }
     );
-
+    
     app.post('/auth/reset-password', authLimiter,
       body('token').isString().notEmpty(),
       body('newPassword').isString().isLength({ min: 8 }).matches(/[A-Z]/).matches(/[a-z]/).matches(/[0-9]/).matches(/[^A-Za-z0-9]/),
