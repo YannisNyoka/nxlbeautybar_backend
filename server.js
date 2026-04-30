@@ -640,15 +640,18 @@ async function startServer() {
           // Removed the NODE_ENV=production guard — this now works in dev too.
           if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
             try {
-              const transporter = nodemailer.createTransport({
-                host:   process.env.SMTP_HOST,
-                port:   Number(process.env.SMTP_PORT) || 587,
-                secure: Number(process.env.SMTP_PORT) === 465,
-                auth: {
-                  user: process.env.SMTP_USER,
-                  pass: process.env.SMTP_PASS,
-                },
-              });
+             const transporter = nodemailer.createTransport({
+  host:              process.env.SMTP_HOST,
+  port:              Number(process.env.SMTP_PORT) || 587,
+  secure:            Number(process.env.SMTP_PORT) === 465,
+  connectionTimeout: 10000,
+  greetingTimeout:   10000,
+  socketTimeout:     15000,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
 
               await transporter.sendMail({
                 from:    `"NXL Beauty Bar" <${process.env.SMTP_USER}>`,
