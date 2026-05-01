@@ -11,7 +11,7 @@ const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 const swaggerUi = require('swagger-ui-express');
 const winston = require('winston');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const crypto = require('crypto');
 
 // Ensure fetch works on Node < 18 (polyfill via node-fetch if needed)
@@ -584,79 +584,49 @@ async function startServer() {
       }
     );
 
-    // ─────────────────────────────────────────────────────────────────────────────
-// In server.js, FIND this entire block (starts around line 490):
-//
-//   app.post('/auth/request-password-reset', authLimiter,
-//     body('email').isEmail().normalizeEmail(),
-//     async (req, res, next) => {
-//       ...
-//       if (process.env.NODE_ENV === 'production' && process.env.SMTP_HOST) {
-//         ...
-//       } else {
-//         logger.info(`Password reset token for ${req.body.email}: ${resetToken}`);
-//       }
-//       ...
-//     }
-//   );
-//
-// REPLACE it entirely with the block below.
-// ─────────────────────────────────────────────────────────────────────────────
-
     app.post('/auth/request-password-reset', authLimiter,
       body('email').isEmail().normalizeEmail(),
       async (req, res, next) => {
         try {
           const errors = validationResult(req);
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
-
+ 
           const user = await db.collection('USERS').findOne({ email: req.body.email });
-
+ 
           // Always return 200 to prevent user enumeration
           if (!user) {
             return res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
           }
-
+ 
           const resetToken = jwt.sign(
             { userId: user._id, email: user.email, type: 'password-reset' },
             jwtSecret,
             { expiresIn: '1h' }
           );
-
+ 
           await db.collection('USERS').updateOne(
             { _id: user._id },
             { $set: { passwordResetToken: resetToken, passwordResetExpiry: new Date(Date.now() + 3600000) } }
           );
-
-          // Build the reset URL using CORS_ORIGIN so it always points to the
-          // correct frontend in both dev and production.
+ 
           const frontendOrigin = (process.env.CORS_ORIGIN || 'http://localhost:5173').replace(/\/$/, '');
           const resetUrl = `${frontendOrigin}/reset-password?token=${resetToken}`;
-
-          // Always log the reset URL — useful for testing and as a fallback.
+ 
+          // Always log the URL as a fallback for testing
           logger.info(`[PASSWORD RESET] Reset URL for ${user.email}: ${resetUrl}`);
-
-          // Attempt to send email whenever SMTP credentials are present.
-          // Removed the NODE_ENV=production guard — this now works in dev too.
-          if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+ 
+          // Send via Resend if API key is configured
+          if (process.env.RESEND_API_KEY) {
             try {
-             // Replace the nodemailer transporter + sendMail block with this:
-const { Resend } = require('resend');
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-await resend.emails.send({
-  from: 'NXL Beauty Bar <onboarding@resend.dev>', // or your verified domain
-  to: user.email,
-  subject: 'Reset Your NXL Beauty Bar Password',
-  html: `... your existing HTML template ...`
-});
-
-              await transporter.sendMail({
-                from:    `"NXL Beauty Bar" <${process.env.SMTP_USER}>`,
-                to:      user.email,
+              const { Resend } = require('resend');
+              const resend = new Resend(process.env.RESEND_API_KEY);
+ 
+              const { error } = await resend.emails.send({
+                from: 'NXL Beauty Bar <onboarding@resend.dev>',
+                to:   user.email,
                 subject: 'Reset Your NXL Beauty Bar Password',
                 html: `
-                  <div style="font-family:'DM Sans',Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
+                  <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
                     <h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2>
                     <h3 style="color:#6b3528;margin-top:0;">Password Reset Request</h3>
                     <p style="color:#555;line-height:1.65;margin-bottom:1.5rem;">
@@ -667,7 +637,7 @@ await resend.emails.send({
                     </p>
                     <div style="text-align:center;margin:2rem 0;">
                       <a href="${resetUrl}"
-                        style="background:linear-gradient(135deg,#3d1f15,#a0502e);color:#ffe8d6;text-decoration:none;padding:0.85rem 2rem;border-radius:50px;font-weight:700;font-size:0.95rem;display:inline-block;">
+                        style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.85rem 2rem;border-radius:50px;font-weight:700;font-size:0.95rem;display:inline-block;">
                         Reset My Password
                       </a>
                     </div>
@@ -677,7 +647,6 @@ await resend.emails.send({
                     </p>
                     <p style="color:#b08070;font-size:0.78rem;margin-top:1.5rem;">
                       If you didn't request a password reset, you can safely ignore this email.
-                      Your password will not change.
                     </p>
                     <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
                     <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">
@@ -686,27 +655,27 @@ await resend.emails.send({
                   </div>
                 `,
               });
-
-              logger.info(`[PASSWORD RESET] Email sent successfully to ${user.email}`);
+ 
+              if (error) {
+                logger.error(`[PASSWORD RESET] Resend error for ${user.email}:`, error);
+              } else {
+                logger.info(`[PASSWORD RESET] Email sent successfully to ${user.email}`);
+              }
             } catch (emailErr) {
-              // Log the error but do NOT fail the request.
-              // The token is saved in the DB and the reset URL is logged above,
-              // so the user can still reset via the logged URL if email fails.
-              logger.error(`[PASSWORD RESET] nodemailer error for ${user.email}: ${emailErr.message}`);
+              // Never block the response — token is saved, URL is logged above
+              logger.error(`[PASSWORD RESET] Resend exception for ${user.email}: ${emailErr.message}`);
             }
           } else {
-            logger.warn(
-              '[PASSWORD RESET] SMTP not configured (SMTP_HOST / SMTP_USER / SMTP_PASS missing). ' +
-              'Email not sent. Copy the reset URL from the log line above and open it in your browser.'
-            );
+            logger.warn('[PASSWORD RESET] RESEND_API_KEY not set — email not sent. Use the reset URL logged above.');
           }
-
+ 
           return res.status(200).json({ success: true, message: 'If the email exists, a reset link has been sent' });
         } catch (err) {
           next(err);
         }
       }
     );
+    
     
     app.post('/auth/reset-password', authLimiter,
       body('token').isString().notEmpty(),
