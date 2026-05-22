@@ -1085,11 +1085,11 @@ async function startServer() {
           if (!appt) return res.status(404).json({ success: false, error: 'Appointment not found' });
 
           const validTransitions = {
-            pending:  ['booked', 'cancelled'],
-            booked:   ['cancelled', 'completed', 'no-show'],
-            cancelled: [],
-            completed: [],
-            'no-show': [],
+           pending:   ['pending',   'booked', 'cancelled'],
+booked:    ['booked',    'cancelled', 'completed', 'no-show'],
+cancelled: ['cancelled'],
+completed: ['completed'],
+'no-show': ['no-show'],
           };
           if (req.body.status && !validTransitions[appt.status]?.includes(req.body.status)) {
             return res.status(400).json({ success: false, error: 'Invalid status transition' });
