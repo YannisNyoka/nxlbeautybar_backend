@@ -273,7 +273,7 @@ const initCollections = async (db) => {
   await db.collection('PRODUCTS').createIndex({ category:1 });
   await db.collection('PRODUCTS').createIndex({ isActive:1,isFeatured:-1,createdAt:-1 });
 
-  await db.createCollection('ORDERS', { validator: { $jsonSchema: { bsonType:'object', required:['userId','items','totalAmount','status','paymentStatus','shippingAddress','createdAt','updatedAt'], properties: { userId:{bsonType:'objectId'}, items:{bsonType:'array',minItems:1}, subtotal:{bsonType:'decimal',minimum:0}, shippingFee:{bsonType:'decimal',minimum:0}, totalAmount:{bsonType:'decimal',minimum:0}, status:{bsonType:'string',enum:['pending','confirmed','processing','shipped','delivered','cancelled','refunded']}, paymentStatus:{bsonType:'string',enum:['unpaid','paid','refunded']}, paymentMethod:{bsonType:'string',enum:['yoco','cash','eft']}, yocoCheckoutId:{bsonType:'string'}, shippingAddress:{bsonType:'object'}, trackingNumber:{bsonType:'string'}, notes:{bsonType:'string'}, createdAt:{bsonType:'date'}, updatedAt:{bsonType:'date'} } } }, validationLevel:'moderate' }).catch(()=>{});
+  await db.createCollection('ORDERS', { validator: { $jsonSchema: { bsonType:'object', required:['userId','items','totalAmount','status','paymentStatus','shippingAddress','createdAt','updatedAt'], properties: { userId:{bsonType:'objectId'}, items:{bsonType:'array',minItems:1}, subtotal:{bsonType:'decimal',minimum:0}, shippingFee:{bsonType:'decimal',minimum:0}, totalAmount:{bsonType:'decimal',minimum:0}, status:{bsonType:'string',enum:['pending','confirmed','processing','ready','shipped','delivered','cancelled','refunded']}, paymentStatus:{bsonType:'string',enum:['unpaid','paid','refunded']}, paymentMethod:{bsonType:'string',enum:['yoco','cash','eft']}, yocoCheckoutId:{bsonType:'string'}, shippingAddress:{bsonType:'object'}, trackingNumber:{bsonType:'string'}, notes:{bsonType:'string'}, createdAt:{bsonType:'date'}, updatedAt:{bsonType:'date'} } } }, validationLevel:'moderate' }).catch(()=>{});
   await db.collection('ORDERS').createIndex({ userId:1,createdAt:-1 });
   await db.collection('ORDERS').createIndex({ status:1 });
 
@@ -1425,9 +1425,16 @@ async function startServer() {
     // POST /shop/orders
     app.post('/shop/orders', authenticateToken, orderLimiter, async (req, res, next) => {
       try {
-        const { items, shippingAddress, notes, discountCode } = req.body;
+        const { items, shippingAddress, notes, discountCode, fulfillmentType } = req.body;
         if (!items || !items.length) return res.status(400).json({ success:false, error:'Cart is empty' });
-        if (!shippingAddress?.fullName || !shippingAddress?.address || !shippingAddress?.city || !shippingAddress?.phone) return res.status(400).json({ success:false, error:'Complete shipping address is required (fullName, address, city, phone)' });
+        const isPickup = fulfillmentType === 'pickup';
+        // For pickup only contact info required; for delivery full address required
+        if (!shippingAddress?.fullName || !shippingAddress?.phone) {
+          return res.status(400).json({ success:false, error:'Name and phone number are required' });
+        }
+        if (!isPickup && (!shippingAddress?.address || !shippingAddress?.city)) {
+          return res.status(400).json({ success:false, error:'Delivery address is required for home delivery' });
+        }
         const productIds = items.map(i => new ObjectId(i.productId));
         const products = await db.collection('PRODUCTS').find({ _id:{ $in:productIds }, isActive:true }).toArray();
         if (products.length !== productIds.length) return res.status(400).json({ success:false, error:'One or more products are unavailable' });
@@ -1461,10 +1468,10 @@ async function startServer() {
         }
 
         const discountedSubtotal = subtotal - discountAmount;
-        const shippingFee = discountedSubtotal >= 500 ? 0 : 80;
+        const shippingFee = isPickup ? 0 : (discountedSubtotal >= 500 ? 0 : 80);
         const totalAmount = discountedSubtotal + shippingFee;
         const now = new Date();
-        const order = { userId:new ObjectId(req.user.userId), items:enrichedItems, subtotal:Decimal128.fromString(subtotal.toFixed(2)), discountAmount:Decimal128.fromString(discountAmount.toFixed(2)), discountCode:appliedCode||null, shippingFee:Decimal128.fromString(shippingFee.toFixed(2)), totalAmount:Decimal128.fromString(totalAmount.toFixed(2)), status:'pending', paymentStatus:'unpaid', paymentMethod:'yoco', shippingAddress, notes:notes||'', createdAt:now, updatedAt:now };
+        const order = { userId:new ObjectId(req.user.userId), items:enrichedItems, fulfillmentType:isPickup?'pickup':'delivery', subtotal:Decimal128.fromString(subtotal.toFixed(2)), discountAmount:Decimal128.fromString(discountAmount.toFixed(2)), discountCode:appliedCode||null, shippingFee:Decimal128.fromString(shippingFee.toFixed(2)), totalAmount:Decimal128.fromString(totalAmount.toFixed(2)), status:'pending', paymentStatus:'unpaid', paymentMethod:'yoco', shippingAddress, notes:sanitiseText(notes||'',500), createdAt:now, updatedAt:now };
         const result = await db.collection('ORDERS').insertOne(order);
         const orderId = result.insertedId.toString();
         const frontendUrl = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
@@ -1544,7 +1551,16 @@ async function startServer() {
     app.put('/shop/admin/orders/:id', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
       try {
         if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
-        const ORDER_TRANSITIONS = { pending:['pending','confirmed','cancelled'], confirmed:['confirmed','processing','cancelled'], processing:['processing','shipped','cancelled'], shipped:['shipped','delivered'], delivered:['delivered','refunded'], cancelled:['cancelled'], refunded:['refunded'] };
+        const ORDER_TRANSITIONS = {
+          pending:    ['pending','confirmed','cancelled'],
+          confirmed:  ['confirmed','processing','ready','cancelled'],
+          processing: ['processing','shipped','ready','cancelled'],
+          ready:      ['ready','delivered'],           // pickup: ready → collected (delivered)
+          shipped:    ['shipped','delivered'],
+          delivered:  ['delivered','refunded'],
+          cancelled:  ['cancelled'],
+          refunded:   ['refunded'],
+        };
         const order = await db.collection('ORDERS').findOne({ _id:new ObjectId(req.params.id) });
         if (!order) return res.status(404).json({ success:false, error:'Order not found' });
         if (req.body.status) {
@@ -1558,15 +1574,17 @@ async function startServer() {
         if (req.body.paymentStatus  !== undefined) update.paymentStatus  = req.body.paymentStatus;
         const updated = await db.collection('ORDERS').findOneAndUpdate({ _id:new ObjectId(req.params.id) }, { $set:update }, { returnDocument:'after' });
 
-        // ── Order shipped email ────────────────────────────────────────────
-        if (req.body.status === 'shipped' && process.env.RESEND_API_KEY) {
+        // ── Order shipped / ready-to-collect email ────────────────────────
+        const isShippedEmail = req.body.status === 'shipped' || req.body.status === 'ready';
+        if (isShippedEmail && process.env.RESEND_API_KEY) {
           try {
-            const resend   = new Resend(process.env.RESEND_API_KEY);
-            const customer = await db.collection('USERS').findOne({ _id: order.userId }, { projection:{ email:1, firstName:1 } });
-            const toEmail  = customer?.email || order.shippingAddress?.email;
-            const tracking = req.body.trackingNumber || order.trackingNumber;
-            const shortId  = req.params.id.slice(-6).toUpperCase();
-            const itemsList = (order.items || []).map(i =>
+            const resend      = new Resend(process.env.RESEND_API_KEY);
+            const customer    = await db.collection('USERS').findOne({ _id: order.userId }, { projection:{ email:1, firstName:1 } });
+            const toEmail     = customer?.email || order.shippingAddress?.email;
+            const tracking    = req.body.trackingNumber || order.trackingNumber;
+            const shortId     = req.params.id.slice(-6).toUpperCase();
+            const isPickupOrder = order.fulfillmentType === 'pickup';
+            const itemsList   = (order.items || []).map(i =>
               `<tr>
                 <td style="padding:0.5rem 0;color:#555;">${i.productName}</td>
                 <td style="padding:0.5rem 0;text-align:right;color:#555;">x${i.quantity}</td>
@@ -1577,21 +1595,46 @@ async function startServer() {
               await resend.emails.send({
                 from:    'NXL Beauty Bar <onboarding@resend.dev>',
                 to:      toEmail,
-                subject: `Your Order #${shortId} Has Shipped! 🚚`,
+                subject: isPickupOrder
+                  ? `Your Order #${shortId} is Ready to Collect! 🏪`
+                  : `Your Order #${shortId} Has Shipped! 🚚`,
                 html: `
                   <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
                     <h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2>
-                    <h3 style="color:#6b3528;margin-top:0;">Your Order is on its Way! 🚚</h3>
+                    <h3 style="color:#6b3528;margin-top:0;">${isPickupOrder ? 'Your Order is Ready to Collect! 🏪' : 'Your Order is on its Way! 🚚'}</h3>
                     <p style="color:#555;line-height:1.65;">Hi ${customer?.firstName || order.shippingAddress?.fullName},</p>
-                    <p style="color:#555;line-height:1.65;">Great news — your order <strong>#${shortId}</strong> has been shipped and is on its way to you!</p>
+                    <p style="color:#555;line-height:1.65;">
+                      ${isPickupOrder
+                        ? `Great news — your order <strong>#${shortId}</strong> is ready for collection at our salon!`
+                        : `Great news — your order <strong>#${shortId}</strong> has been shipped and is on its way to you!`
+                      }
+                    </p>
 
+                    ${isPickupOrder ? `
+                    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:1rem 1.25rem;margin:1.25rem 0;">
+                      <p style="margin:0;font-size:0.85rem;font-weight:700;color:#15803d;">📍 Collection Address</p>
+                      <p style="margin:0.35rem 0 0;font-size:0.85rem;color:#555;">NXL Beauty Bar</p>
+                      <p style="margin:0.15rem 0 0;font-size:0.82rem;color:#9e7060;">1948 Mahalefele Rd, Dube, Soweto, 1800</p>
+                      <p style="margin:0.15rem 0 0;font-size:0.82rem;color:#9e7060;">📞 068 511 3394 &nbsp;|&nbsp; 🕐 Mon–Sat 9AM–5PM</p>
+                      <p style="margin:0.5rem 0 0;font-size:0.8rem;color:#6b3528;font-weight:600;">Please bring your order number: <span style="font-family:monospace;font-size:0.95rem;">#${shortId}</span></p>
+                    </div>
+                    ` : `
                     ${tracking ? `
                     <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:1rem 1.25rem;margin:1.25rem 0;text-align:center;">
                       <p style="margin:0;font-size:0.78rem;color:#15803d;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">Tracking Number</p>
                       <p style="margin:0.4rem 0 0;font-size:1.25rem;font-weight:700;color:#3d1f15;font-family:monospace;">${tracking}</p>
-                      <p style="margin:0.35rem 0 0;font-size:0.75rem;color:#9e7060;">Use this number to track your parcel with your courier</p>
+                      <p style="margin:0.35rem 0 0;font-size:0.75rem;color:#9e7060;">Use this number to track your parcel</p>
                     </div>
                     ` : ''}
+                    <div style="background:#fff8f3;border:1px solid #e0ccc4;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem;">
+                      <p style="margin:0;font-size:0.82rem;font-weight:700;color:#6b3528;">📦 Delivering to</p>
+                      <p style="margin:0.35rem 0 0;font-size:0.82rem;color:#9e7060;line-height:1.65;">
+                        ${order.shippingAddress?.fullName}<br/>
+                        ${order.shippingAddress?.address}, ${order.shippingAddress?.city}<br/>
+                        ${order.shippingAddress?.province || ''} ${order.shippingAddress?.postalCode || ''}
+                      </p>
+                    </div>
+                    `}
 
                     <div style="background:#fff;border:1px solid #e0ccc4;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem;">
                       <p style="margin:0 0 0.75rem;font-weight:700;color:#3d1f15;font-size:0.85rem;">Items in this order:</p>
@@ -1605,22 +1648,13 @@ async function startServer() {
                       </div>
                     </div>
 
-                    <div style="background:#fff8f3;border:1px solid #e0ccc4;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem;">
-                      <p style="margin:0;font-size:0.82rem;font-weight:700;color:#6b3528;">📦 Delivering to</p>
-                      <p style="margin:0.35rem 0 0;font-size:0.82rem;color:#9e7060;line-height:1.65;">
-                        ${order.shippingAddress?.fullName}<br/>
-                        ${order.shippingAddress?.address}, ${order.shippingAddress?.city}<br/>
-                        ${order.shippingAddress?.province || ''} ${order.shippingAddress?.postalCode || ''}
-                      </p>
-                    </div>
-
-                    <p style="color:#9e7060;font-size:0.8rem;line-height:1.65;">Questions about your order? WhatsApp us at <a href="https://wa.me/27685113394" style="color:#a0502e;">068 511 3394</a> or email <a href="mailto:nxlbeautybar@gmail.com" style="color:#a0502e;">nxlbeautybar@gmail.com</a>.</p>
+                    <p style="color:#9e7060;font-size:0.8rem;line-height:1.65;">Questions? WhatsApp us at <a href="https://wa.me/27685113394" style="color:#a0502e;">068 511 3394</a> or email <a href="mailto:nxlbeautybar@gmail.com" style="color:#a0502e;">nxlbeautybar@gmail.com</a>.</p>
                     <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
                     <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p>
                   </div>
                 `,
               });
-              logger.info(`[SHIPPED EMAIL] Sent to ${toEmail}`, { orderId: req.params.id, tracking });
+              logger.info(`[${isPickupOrder ? 'PICKUP' : 'SHIPPED'} EMAIL] Sent to ${toEmail}`, { orderId: req.params.id });
             }
           } catch (emailErr) {
             logger.error(`[SHIPPED EMAIL] Failed: ${emailErr.message}`);
