@@ -1503,6 +1503,30 @@ async function startServer() {
         if (order.status === 'confirmed' && order.paymentStatus === 'paid') return res.json({ success:true, alreadyConfirmed:true, order });
         await db.collection('ORDERS').updateOne({ _id:new ObjectId(orderId) }, { $set:{ status:'confirmed', paymentStatus:'paid', updatedAt:new Date() } });
         for (const item of order.items||[]) { await db.collection('PRODUCTS').updateOne({ _id:item.productId }, { $inc:{ stock:-item.quantity } }); }
+
+        // ── Low stock check after deduction ────────────────────────────────
+        if (process.env.RESEND_API_KEY && process.env.ADMIN_EMAIL) {
+          try {
+            const productIds = (order.items||[]).map(i => i.productId).filter(Boolean);
+            const lowStockProducts = await db.collection('PRODUCTS').find({
+              _id: { $in: productIds }, isActive: true, stock: { $lte: 5 },
+            }).toArray();
+            if (lowStockProducts.length > 0) {
+              const resend = new Resend(process.env.RESEND_API_KEY);
+              const itemRows = lowStockProducts.map(p =>
+                `<tr><td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;font-weight:600;color:#3d1f15;">${p.name}</td><td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;text-align:center;font-weight:800;color:${p.stock===0?'#dc2626':'#c05621'};font-size:1rem;">${p.stock}</td><td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;color:#9e7060;font-size:0.82rem;">${p.stock===0?'🔴 Out of stock':'🟡 Low stock'}</td></tr>`
+              ).join('');
+              await resend.emails.send({
+                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                to:      process.env.ADMIN_EMAIL,
+                subject: `⚠️ Low Stock Alert — ${lowStockProducts.length} product${lowStockProducts.length>1?'s need':' needs'} restocking`,
+                html:`<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;"><h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2><h3 style="color:#c05621;margin-top:0;">⚠️ Low Stock Alert</h3><p style="color:#555;line-height:1.65;">The following product${lowStockProducts.length>1?'s are':' is'} running low after a recent sale:</p><table style="width:100%;border-collapse:collapse;margin:1.25rem 0;background:#fff;border-radius:10px;overflow:hidden;"><thead><tr style="background:#f9f1ec;"><th style="padding:0.6rem 0.75rem;text-align:left;font-size:0.72rem;color:#9e7060;text-transform:uppercase;">Product</th><th style="padding:0.6rem 0.75rem;text-align:center;font-size:0.72rem;color:#9e7060;text-transform:uppercase;">Stock Left</th><th style="padding:0.6rem 0.75rem;text-align:left;font-size:0.72rem;color:#9e7060;text-transform:uppercase;">Status</th></tr></thead><tbody>${itemRows}</tbody></table><div style="text-align:center;margin:1.5rem 0;"><a href="${(process.env.CORS_ORIGIN||'https://nxlbeautybar.co.za').replace(/\/$/,'')}/admin-dashboard" style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.75rem 2rem;border-radius:50px;font-weight:700;font-size:0.88rem;display:inline-block;">Go to Admin Dashboard →</a></div></div>`,
+              });
+              logger.info(`[LOW STOCK EMAIL] Sent after payment — ${lowStockProducts.length} product(s) low`);
+            }
+          } catch (e) { logger.error(`[LOW STOCK EMAIL] ${e.message}`); }
+        }
+        // ──────────────────────────────────────────────────────────────────
         if (process.env.RESEND_API_KEY) {
           try {
             const resend = new Resend(process.env.RESEND_API_KEY);
@@ -1662,11 +1686,164 @@ async function startServer() {
         }
         // ──────────────────────────────────────────────────────────────────
 
+        // ── Stock management on status change ────────────────────────────
+        if (req.body.status === 'cancelled' || req.body.status === 'refunded') {
+          // Restore stock for each item when order is cancelled or refunded
+          try {
+            for (const item of order.items || []) {
+              await db.collection('PRODUCTS').updateOne(
+                { _id: item.productId },
+                { $inc: { stock: item.quantity } }
+              );
+            }
+            logger.info(`[STOCK] Restored stock for ${order.items?.length || 0} item(s) — order ${req.params.id} ${req.body.status}`);
+          } catch (stockErr) {
+            logger.error(`[STOCK] Failed to restore stock: ${stockErr.message}`);
+          }
+        }
+
+        // ── Low stock alert email to admin after any stock-affecting update ──
+        if (
+          (req.body.status === 'cancelled' || req.body.status === 'refunded' ||
+           req.body.status === 'delivered' || req.body.status === 'shipped') &&
+          process.env.RESEND_API_KEY && process.env.ADMIN_EMAIL
+        ) {
+          try {
+            const LOW_STOCK_THRESHOLD = 5;
+            const productIds = (order.items || []).map(i => i.productId).filter(Boolean);
+            const lowStockProducts = await db.collection('PRODUCTS').find({
+              _id: { $in: productIds },
+              isActive: true,
+              stock: { $lte: LOW_STOCK_THRESHOLD },
+            }).toArray();
+
+            if (lowStockProducts.length > 0) {
+              const resend = new Resend(process.env.RESEND_API_KEY);
+              const itemRows = lowStockProducts.map(p =>
+                `<tr>
+                  <td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;font-weight:600;color:#3d1f15;">${p.name}</td>
+                  <td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;text-align:center;">
+                    <span style="font-weight:800;color:${p.stock === 0 ? '#dc2626' : '#c05621'};font-size:1rem;">${p.stock}</span>
+                  </td>
+                  <td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;color:#9e7060;font-size:0.82rem;">${p.stock === 0 ? '🔴 Out of stock' : '🟡 Low stock'}</td>
+                </tr>`
+              ).join('');
+
+              await resend.emails.send({
+                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                to:      process.env.ADMIN_EMAIL,
+                subject: `⚠️ Low Stock Alert — ${lowStockProducts.length} product${lowStockProducts.length > 1 ? 's need' : ' needs'} restocking`,
+                html: `
+                  <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
+                    <h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2>
+                    <h3 style="color:#c05621;margin-top:0;">⚠️ Low Stock Alert</h3>
+                    <p style="color:#555;line-height:1.65;">The following product${lowStockProducts.length > 1 ? 's are' : ' is'} running low and need${lowStockProducts.length === 1 ? 's' : ''} restocking:</p>
+                    <table style="width:100%;border-collapse:collapse;margin:1.25rem 0;background:#fff;border-radius:10px;overflow:hidden;">
+                      <thead>
+                        <tr style="background:#f9f1ec;">
+                          <th style="padding:0.6rem 0.75rem;text-align:left;font-size:0.72rem;color:#9e7060;text-transform:uppercase;letter-spacing:0.06em;">Product</th>
+                          <th style="padding:0.6rem 0.75rem;text-align:center;font-size:0.72rem;color:#9e7060;text-transform:uppercase;letter-spacing:0.06em;">Stock Left</th>
+                          <th style="padding:0.6rem 0.75rem;text-align:left;font-size:0.72rem;color:#9e7060;text-transform:uppercase;letter-spacing:0.06em;">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>${itemRows}</tbody>
+                    </table>
+                    <p style="color:#9e7060;font-size:0.82rem;line-height:1.65;">Log in to your admin dashboard to update stock levels.</p>
+                    <div style="text-align:center;margin:1.5rem 0;">
+                      <a href="${(process.env.CORS_ORIGIN||'https://nxlbeautybar.co.za').replace(/\/$/,'')}/admin-dashboard" style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.75rem 2rem;border-radius:50px;font-weight:700;font-size:0.88rem;display:inline-block;">Go to Admin Dashboard →</a>
+                    </div>
+                    <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
+                    <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p>
+                  </div>
+                `,
+              });
+              logger.info(`[LOW STOCK EMAIL] Sent to admin — ${lowStockProducts.length} product(s) low`);
+            }
+          } catch (stockEmailErr) {
+            logger.error(`[LOW STOCK EMAIL] Failed: ${stockEmailErr.message}`);
+          }
+        }
+        // ─────────────────────────────────────────────────────────────────
+
         res.json({ success:true, data:updated });
       } catch (err) { next(err); }
     });
 
-    // GET /shop/orders/:id — single order  ← AFTER all specific /shop/orders routes
+    // ── robots.txt ────────────────────────────────────────────────────────
+    app.get('/robots.txt', (req, res) => {
+      const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
+      res.type('text/plain').send(
+`User-agent: *
+Allow: /
+Disallow: /admin-dashboard
+Disallow: /dashboard
+Disallow: /profile
+Disallow: /cart
+Disallow: /checkout
+Disallow: /shop/order-success
+Disallow: /orders
+Disallow: /reset-password
+Disallow: /payment
+
+Sitemap: ${frontendUrl}/sitemap.xml`
+      );
+    });
+
+    // ── sitemap.xml — dynamic, includes all products and services ─────────
+    app.get('/sitemap.xml', async (req, res) => {
+      try {
+        const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
+        const now = new Date().toISOString().slice(0, 10);
+
+        // Fetch all active products and services
+        const [products, services] = await Promise.all([
+          db.collection('PRODUCTS').find({ isActive: true }, { projection: { _id:1, name:1, updatedAt:1, category:1 } }).toArray(),
+          db.collection('SERVICES').find({ isActive: true }, { projection: { _id:1, name:1, updatedAt:1 } }).toArray(),
+        ]);
+
+        const staticPages = [
+          { url: '/',       priority: '1.0', freq: 'weekly'  },
+          { url: '/shop',   priority: '0.9', freq: 'daily'   },
+          { url: '/login',  priority: '0.5', freq: 'monthly' },
+          { url: '/signup', priority: '0.5', freq: 'monthly' },
+        ];
+
+        const productPages = products.map(p => ({
+          url:      `/shop/product/${p._id}`,
+          priority: '0.8',
+          freq:     'weekly',
+          lastmod:  p.updatedAt ? new Date(p.updatedAt).toISOString().slice(0,10) : now,
+        }));
+
+        const allPages = [
+          ...staticPages.map(p => ({ ...p, lastmod: now })),
+          ...productPages,
+        ];
+
+        const urlEntries = allPages.map(p => `
+  <url>
+    <loc>${frontendUrl}${p.url}</loc>
+    <lastmod>${p.lastmod}</lastmod>
+    <changefreq>${p.freq}</changefreq>
+    <priority>${p.priority}</priority>
+  </url>`).join('');
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9
+        http://www.sitemaps.org/schemas/sitemap/0.9/sitemap.xsd">
+${urlEntries}
+</urlset>`;
+
+        res.type('application/xml').send(xml);
+        logger.info(`[SITEMAP] Served ${allPages.length} URLs`);
+      } catch (err) {
+        logger.error(`[SITEMAP] Error: ${err.message}`);
+        res.status(500).send('Error generating sitemap');
+      }
+    });
+    // ──────────────────────────────────────────────────────────────────────
     app.get('/shop/orders/:id', authenticateToken, async (req, res, next) => {
       try {
         if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
