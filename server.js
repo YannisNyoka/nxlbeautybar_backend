@@ -219,12 +219,13 @@ const initCollections = async (db) => {
   await db.createCollection('USERS', { validator: { $jsonSchema: { bsonType:'object', required:['email','password','firstName','lastName','role','isActive','createdAt','updatedAt'], properties: { email:{bsonType:'string',pattern:'^\\S+@\\S+\\.\\S+$'}, password:{bsonType:'string',minLength:60}, firstName:{bsonType:'string',minLength:1}, lastName:{bsonType:'string',minLength:1}, role:{bsonType:'string',enum:['user','admin']}, isActive:{bsonType:'bool'}, createdAt:{bsonType:'date'}, updatedAt:{bsonType:'date'} } } }, validationLevel:'strict' }).catch(()=>{});
   try { await db.collection('USERS').dropIndex('email_1'); } catch(e) {}
   await db.collection('USERS').createIndex({ email:1 }, { unique:true, name:'email_unique_idx' });
+  await db.collection('USERS').createIndex({ referralCode:1 }, { sparse:true, unique:true });
 
   await db.createCollection('SERVICES', { validator: { $jsonSchema: { bsonType:'object', required:['name','durationMinutes','price','isActive','createdAt','updatedAt'], properties: { name:{bsonType:'string',minLength:1}, durationMinutes:{bsonType:'int',minimum:15}, price:{bsonType:'decimal',minimum:0}, isActive:{bsonType:'bool'}, createdAt:{bsonType:'date'}, updatedAt:{bsonType:'date'} } } }, validationLevel:'strict' }).catch(()=>{});
   try { await db.collection('SERVICES').dropIndex('name_1'); } catch(e) {}
   await db.collection('SERVICES').createIndex({ name:1 }, { unique:true, name:'service_name_unique_idx' });
 
-  await db.createCollection('EMPLOYEES', { validator: { $jsonSchema: { bsonType:'object', required:['name','servicesOffered','isActive','createdAt','updatedAt'], properties: { name:{bsonType:'string',minLength:1}, email:{bsonType:['string','null'],pattern:'^\\S+@\\S+\\.\\S+$'}, servicesOffered:{bsonType:'array',minItems:1,items:{bsonType:'objectId'}}, isActive:{bsonType:'bool'}, createdAt:{bsonType:'date'}, updatedAt:{bsonType:'date'} } } }, validationLevel:'strict' }).catch(()=>{});
+  await db.createCollection('EMPLOYEES', { validator: { $jsonSchema: { bsonType:'object', required:['name','servicesOffered','isActive','createdAt','updatedAt'], properties: { name:{bsonType:'string',minLength:1}, email:{bsonType:['string','null']}, phone:{bsonType:['string','null']}, bio:{bsonType:['string','null']}, role:{bsonType:['string','null']}, color:{bsonType:['string','null']}, workingHours:{bsonType:['object','null']}, servicesOffered:{bsonType:'array',minItems:1,items:{bsonType:'objectId'}}, isActive:{bsonType:'bool'}, createdAt:{bsonType:'date'}, updatedAt:{bsonType:'date'} } } }, validationLevel:'moderate' }).catch(()=>{});
   try { await db.collection('EMPLOYEES').dropIndex('email_1'); } catch(e) {}
   await db.collection('EMPLOYEES').createIndex({ email:1 }, { unique:true, sparse:true, name:'employee_email_unique_idx' });
 
@@ -250,6 +251,37 @@ const initCollections = async (db) => {
   await db.createCollection('GALLERY').catch(()=>{});
   await db.collection('GALLERY').createIndex({ createdAt:-1 });
 
+  // CLIENT GALLERY — before/after photos submitted by clients after appointments
+  await db.createCollection('CLIENT_GALLERY', {}).catch(() => {});
+  await db.collection('CLIENT_GALLERY').createIndex({ userId: 1 });
+  await db.collection('CLIENT_GALLERY').createIndex({ appointmentId: 1 });
+  await db.collection('CLIENT_GALLERY').createIndex({ status: 1, createdAt: -1 });
+
+  // CLIENT_NOTIFICATIONS — in-app notifications for customers
+  await db.createCollection('CLIENT_NOTIFICATIONS', {}).catch(() => {});
+  await db.collection('CLIENT_NOTIFICATIONS').createIndex({ userId: 1, createdAt: -1 });
+  await db.collection('CLIENT_NOTIFICATIONS').createIndex({ userId: 1, read: 1 });
+
+  // REFERRALS — referral program
+  await db.createCollection('REFERRALS', {}).catch(() => {});
+  await db.collection('REFERRALS').createIndex({ referrerId: 1 });
+  await db.collection('REFERRALS').createIndex({ referralCode: 1 }, { unique: true });
+  await db.collection('REFERRALS').createIndex({ refereeId: 1 });
+
+  // SUBSCRIPTION_PLANS — admin-defined monthly plans
+  await db.createCollection('SUBSCRIPTION_PLANS', {}).catch(() => {});
+  await db.collection('SUBSCRIPTION_PLANS').createIndex({ isActive: 1 });
+
+  // SUBSCRIPTIONS — client subscriptions
+  await db.createCollection('SUBSCRIPTIONS', {}).catch(() => {});
+  await db.collection('SUBSCRIPTIONS').createIndex({ userId: 1 });
+  await db.collection('SUBSCRIPTIONS').createIndex({ planId: 1 });
+  await db.collection('SUBSCRIPTIONS').createIndex({ status: 1, renewalDate: 1 });
+
+
+
+
+
   // DISCOUNT_CODES
   await db.createCollection('DISCOUNT_CODES', {
     validator: { $jsonSchema: { bsonType:'object', required:['code','type','value','isActive','createdAt'], properties: {
@@ -267,6 +299,31 @@ const initCollections = async (db) => {
     validationLevel: 'moderate'
   }).catch(()=>{});
   await db.collection('DISCOUNT_CODES').createIndex({ code:1 }, { unique:true });
+
+  // LOYALTY
+  await db.createCollection('LOYALTY', {}).catch(() => {});
+  await db.collection('LOYALTY').createIndex({ userId: 1 }, { unique: true });
+
+  // LOYALTY_TRANSACTIONS
+  await db.createCollection('LOYALTY_TRANSACTIONS', {}).catch(() => {});
+  await db.collection('LOYALTY_TRANSACTIONS').createIndex({ userId: 1 });
+  await db.collection('LOYALTY_TRANSACTIONS').createIndex({ createdAt: -1 });
+
+  // GIFT_CARDS
+  await db.createCollection('GIFT_CARDS', {}).catch(() => {});
+  await db.collection('GIFT_CARDS').createIndex({ code: 1 }, { unique: true });
+  await db.collection('GIFT_CARDS').createIndex({ recipientEmail: 1 });
+
+  // INVENTORY (purchase orders + stock history)
+  await db.createCollection('INVENTORY_ORDERS', {}).catch(() => {});
+  await db.collection('INVENTORY_ORDERS').createIndex({ productId: 1 });
+  await db.collection('INVENTORY_ORDERS').createIndex({ createdAt: -1 });
+
+  // SUPPLIERS
+  await db.createCollection('SUPPLIERS', {}).catch(() => {});
+  await db.collection('SUPPLIERS').createIndex({ name: 1 });
+
+
 
   await db.createCollection('PRODUCTS', { validator: { $jsonSchema: { bsonType:'object', required:['name','price','category','stock','isActive','createdAt','updatedAt'], properties: { name:{bsonType:'string',minLength:1}, description:{bsonType:'string'}, price:{bsonType:'decimal',minimum:0}, comparePrice:{bsonType:['decimal','null']}, category:{bsonType:'string',enum:['nails','hair','skincare','accessories','professional','other']}, images:{bsonType:'array',items:{bsonType:'string'}}, stock:{bsonType:'int',minimum:0}, sku:{bsonType:'string'}, brand:{bsonType:'string'}, tags:{bsonType:'array',items:{bsonType:'string'}}, isActive:{bsonType:'bool'}, isFeatured:{bsonType:'bool'}, createdAt:{bsonType:'date'}, updatedAt:{bsonType:'date'} } } }, validationLevel:'moderate' }).catch(()=>{});
   await db.collection('PRODUCTS').createIndex({ name:'text',description:'text',brand:'text',tags:'text' });
@@ -370,6 +427,83 @@ async function startServer() {
             } catch (emailErr) {
               logger.error(`[WELCOME EMAIL] Failed: ${emailErr.message}`);
             }
+          }
+          // ─────────────────────────────────────────────────────────────────
+
+          // ── Signup loyalty bonus ───────────────────────────────────────────
+          try {
+            await awardPoints(result.insertedId, LOYALTY_CONFIG.signupBonus, 'Welcome bonus — new member');
+          } catch (loyaltyErr) { logger.error(`[LOYALTY] Signup bonus failed: ${loyaltyErr.message}`); }
+          // ─────────────────────────────────────────────────────────────────
+
+          // ── Referral program — handle referral code on signup ─────────────
+          const { referralCode: refCode } = req.body;
+          if (refCode) {
+            try {
+              const referrer = await db.collection('USERS').findOne(
+                { referralCode: refCode.trim().toUpperCase() },
+                { projection: { _id:1, firstName:1 } }
+              );
+              if (referrer && String(referrer._id) !== String(result.insertedId)) {
+                // Record the referral
+                await db.collection('REFERRALS').insertOne({
+                  referrerId:    referrer._id,
+                  refereeId:     result.insertedId,
+                  referralCode:  refCode.trim().toUpperCase(),
+                  status:        'signed_up',
+                  pointsAwarded: 0,
+                  discountGiven: REFERRAL_CONFIG.refereeDiscount,
+                  createdAt:     new Date(),
+                  updatedAt:     new Date(),
+                });
+
+                // Tag user as referred
+                await db.collection('USERS').updateOne(
+                  { _id: result.insertedId },
+                  { $set: { referredBy: referrer._id, referredByCode: refCode.trim().toUpperCase() } }
+                );
+
+                // Give referrer signup bonus points
+                await awardPoints(referrer._id, REFERRAL_CONFIG.signupBonus,
+                  `Referral signup bonus — ${firstName} joined`);
+
+                // Notify referrer
+                await notifyClient(referrer._id, {
+                  type:  'loyalty_earned',
+                  title: `${firstName} joined using your referral! 🎉`,
+                  body:  `You earned +${REFERRAL_CONFIG.signupBonus} points. You'll earn +${REFERRAL_CONFIG.referrerPoints} more when they complete their first booking.`,
+                  link:  '/profile',
+                  meta:  { points: REFERRAL_CONFIG.signupBonus },
+                });
+
+                // Create a one-time discount code for the referee (R50 off first order)
+                const discountCode = `REF${refCode.slice(-4)}${result.insertedId.toString().slice(-4).toUpperCase()}`;
+                await db.collection('DISCOUNT_CODES').insertOne({
+                  code:           discountCode,
+                  type:           'fixed',
+                  value:          REFERRAL_CONFIG.refereeDiscount,
+                  description:    `Welcome gift from ${referrer.firstName} — R${REFERRAL_CONFIG.refereeDiscount} off your first order`,
+                  minOrderAmount: 0,
+                  usageLimit:     1,
+                  usedCount:      0,
+                  isActive:       true,
+                  expiresAt:      new Date(Date.now() + 90 * 24 * 60 * 60 * 1000), // 90 days
+                  forUserId:      result.insertedId,
+                  createdAt:      new Date(),
+                });
+
+                // Notify new user of their discount
+                await notifyClient(result.insertedId, {
+                  type:  'promotion',
+                  title: `Welcome gift from ${referrer.firstName}! 🎁`,
+                  body:  `You have a R${REFERRAL_CONFIG.refereeDiscount} discount waiting. Use code ${discountCode} at checkout. Valid for 90 days.`,
+                  link:  '/shop',
+                  meta:  { code: discountCode },
+                });
+
+                logger.info(`[REFERRAL] ${firstName} signed up via referral from ${referrer.firstName}`);
+              }
+            } catch (refErr) { logger.error(`[REFERRAL] Signup handling failed: ${refErr.message}`); }
           }
           // ─────────────────────────────────────────────────────────────────
 
@@ -744,6 +878,64 @@ async function startServer() {
           if (collectionName === 'PAYMENTS') {
             const nextStatus = req.body.type === 'deposit' ? 'deposit_paid' : 'paid';
             await db.collection('APPOINTMENTS').updateOne({ _id:req.body.appointmentId }, { $set:{ paymentStatus:nextStatus, updatedAt:new Date() } });
+
+            // ── SMS confirmation after booking payment ────────────────────
+          try {
+            const apptForSMS = await db.collection('APPOINTMENTS').findOne({ _id: req.body.appointmentId });
+            const clientForSMS = await db.collection('USERS').findOne({ _id: apptForSMS?.userId });
+            if (clientForSMS?.phone) {
+              const svcs = await db.collection('SERVICES').find({ _id:{ $in: apptForSMS.serviceIds||[] } }).project({ name:1 }).toArray();
+              const svcNames = svcs.map(s => s.name).join(', ');
+              await sendSMS(clientForSMS.phone,
+                `NXL Beauty Bar: Payment confirmed! Your appointment for ${svcNames} on ${apptForSMS.date} at ${apptForSMS.time} is booked. See you soon! 💅`
+              );
+            }
+            // In-app notification
+            if (apptForSMS?.userId) {
+              const svcs2    = apptForSMS._svcs || await db.collection('SERVICES').find({ _id:{ $in: apptForSMS.serviceIds||[] } }).project({ name:1 }).toArray();
+              const svcNames = svcs2.map(s => s.name).join(', ');
+              await notifyClient(apptForSMS.userId, {
+                type:  'booking_confirmed',
+                title: 'Booking Confirmed ✅',
+                body:  `Your appointment for ${svcNames} on ${apptForSMS.date} at ${apptForSMS.time} is confirmed.`,
+                link:  '/dashboard',
+              });
+            }
+          } catch (smsErr) { logger.error(`[SMS] Booking confirm failed: ${smsErr.message}`); }
+          // ──────────────────────────────────────────────────────────────
+
+          // ── Award loyalty points for booking payment ──────────────────
+            try {
+              const apptForPoints = await db.collection('APPOINTMENTS').findOne({ _id: req.body.appointmentId });
+              if (apptForPoints?.userId) {
+                const amountPaid  = parseFloat(req.body.amount || 0);
+                const earnedPts   = Math.floor(amountPaid * LOYALTY_CONFIG.pointsPerRand) + LOYALTY_CONFIG.bookingBonus;
+                await awardPoints(apptForPoints.userId, earnedPts, `Booking payment — ${amountPaid.toFixed(2)} ZAR`, req.body.appointmentId);
+
+                // ── Referral reward — first completed booking ─────────────
+                try {
+                  const booker = await db.collection('USERS').findOne({ _id: apptForPoints.userId }, { projection: { referredBy:1, firstName:1, referralRewardGiven:1 } });
+                  if (booker?.referredBy && !booker.referralRewardGiven) {
+                    await awardPoints(booker.referredBy, REFERRAL_CONFIG.referrerPoints, `Referral reward — ${booker.firstName} completed first booking`);
+                    await db.collection('REFERRALS').updateOne(
+                      { referrerId: booker.referredBy, refereeId: apptForPoints.userId },
+                      { $set: { status: 'rewarded', pointsAwarded: REFERRAL_CONFIG.referrerPoints, rewardedAt: new Date(), updatedAt: new Date() } }
+                    );
+                    await db.collection('USERS').updateOne({ _id: apptForPoints.userId }, { $set: { referralRewardGiven: true } });
+                    await notifyClient(booker.referredBy, {
+                      type:  'loyalty_earned',
+                      title: `Referral reward — +${REFERRAL_CONFIG.referrerPoints} points! 🏆`,
+                      body:  `${booker.firstName} completed their first booking. You earned ${REFERRAL_CONFIG.referrerPoints} loyalty points!`,
+                      link:  '/profile',
+                      meta:  { points: REFERRAL_CONFIG.referrerPoints },
+                    });
+                    logger.info(`[REFERRAL] Rewarded referrer for ${booker.firstName}'s first booking`);
+                  }
+                } catch (refErr) { logger.error(`[REFERRAL] First booking reward failed: ${refErr.message}`); }
+                // ─────────────────────────────────────────────────────────
+              }
+            } catch (loyaltyErr) { logger.error(`[LOYALTY] Booking award failed: ${loyaltyErr.message}`); }
+            // ─────────────────────────────────────────────────────────────
           }
           res.status(201).json({ success:true, message:'Created', data:{ _id:result.insertedId, ...req.body } });
         } catch (err) {
@@ -910,7 +1102,15 @@ async function startServer() {
       app.get(`/${route}`, authenticateToken, async (req, res, next) => {
         if (!db) return res.status(500).json({ success:false, error:'Database not connected' });
         try {
-          let docs = await db.collection(collectionName).find({}).limit(500).toArray();
+          // ── Pagination support ──────────────────────────────────────────
+          const page  = Math.max(1, parseInt(req.query.page  || '1',  10));
+          const limit = Math.min(500, Math.max(1, parseInt(req.query.limit || '500', 10)));
+          const skip  = (page - 1) * limit;
+
+          const total = await db.collection(collectionName).countDocuments({});
+          let docs = await db.collection(collectionName).find({}).sort({ createdAt:-1 }).skip(skip).limit(limit).toArray();
+          // ────────────────────────────────────────────────────────────────
+
           if (collectionName === 'APPOINTMENTS') {
             const userIds = [...new Set(docs.map(d => d.userId))];
             const employeeIds = [...new Set(docs.map(d => d.employeeId))];
@@ -923,7 +1123,7 @@ async function startServer() {
             const svcMap = Object.fromEntries(services.map(s => [s._id.toString(), s]));
             docs = docs.map(doc => ({ ...doc, userName: userMap[doc.userId.toString()]?.firstName + ' ' + userMap[doc.userId.toString()]?.lastName, user:userMap[doc.userId.toString()], employee:empMap[doc.employeeId.toString()], services:doc.serviceIds.map(id => svcMap[id.toString()]).filter(Boolean), totalDuration:doc.totalDuration || doc.serviceIds.reduce((sum, id) => { const svc = svcMap[id.toString()]; return sum + (svc?.durationMinutes || 0); }, 0) }));
           }
-          res.status(200).json({ success:true, data:docs });
+          res.status(200).json({ success:true, data:docs, total, page, pages: Math.ceil(total/limit), limit });
         } catch (err) { next(err); }
       });
 
@@ -1282,6 +1482,336 @@ async function startServer() {
       } catch (err) { next(err); }
     });
 
+    // ══════════════════════════════════════════════════════════════════════
+    // GIFT CARDS
+    // ══════════════════════════════════════════════════════════════════════
+    function generateGiftCode() {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      let code = 'NXL-';
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) code += chars[Math.floor(Math.random() * chars.length)];
+        if (i < 3) code += '-';
+      }
+      return code;
+    }
+
+    // POST /gift-cards/purchase — buy a gift card (creates pending Yoco checkout)
+    app.post('/gift-cards/purchase', authenticateToken, async (req, res, next) => {
+      try {
+        const { amount, recipientEmail, recipientName, message } = req.body;
+        const validAmounts = [100, 200, 300, 500, 1000];
+        if (!validAmounts.includes(Number(amount)))
+          return res.status(400).json({ success: false, error: `Amount must be one of: R${validAmounts.join(', R')}` });
+        if (!recipientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail))
+          return res.status(400).json({ success: false, error: 'Valid recipient email is required.' });
+
+        let code; let attempts = 0;
+        do { code = generateGiftCode(); attempts++; } while (attempts < 10 && await db.collection('GIFT_CARDS').findOne({ code }));
+
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000); // 1 year
+
+        const card = {
+          code, amount: Number(amount),
+          balance: Number(amount),
+          purchasedBy: new ObjectId(req.user.userId),
+          recipientEmail: recipientEmail.toLowerCase().trim(),
+          recipientName: sanitiseText(recipientName || '', 60),
+          message: sanitiseText(message || '', 200),
+          status: 'pending_payment',
+          redeemedAmount: 0,
+          redemptions: [],
+          expiresAt, createdAt: now, updatedAt: now,
+        };
+
+        const result = await db.collection('GIFT_CARDS').insertOne(card);
+        const cardId  = result.insertedId.toString();
+        const frontendUrl = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
+
+        const yocoResp = await fetchFn('https://payments.yoco.com/api/checkouts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.YOCO_SECRET_KEY}` },
+          body: JSON.stringify({
+            amount: Number(amount) * 100,
+            currency: 'ZAR',
+            successUrl: `${frontendUrl}/gift-cards/success?cardId=${cardId}`,
+            cancelUrl:  `${frontendUrl}/shop?giftCancelled=true`,
+            metadata: { cardId, type: 'gift_card', userId: req.user.userId },
+          }),
+        });
+        const yocoData = await yocoResp.json();
+        if (!yocoData.redirectUrl) return res.status(500).json({ success: false, error: 'Payment init failed.' });
+
+        await db.collection('GIFT_CARDS').updateOne({ _id: result.insertedId }, { $set: { yocoCheckoutId: yocoData.id, updatedAt: new Date() } });
+        res.json({ success: true, data: { cardId, checkoutUrl: yocoData.redirectUrl, code } });
+      } catch (err) { next(err); }
+    });
+
+    // POST /gift-cards/confirm — Yoco webhook or success page confirms payment
+    app.post('/gift-cards/confirm', authenticateToken, async (req, res, next) => {
+      try {
+        const { cardId } = req.body;
+        if (!cardId?.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success: false, error: 'Invalid card ID' });
+        const card = await db.collection('GIFT_CARDS').findOne({ _id: new ObjectId(cardId) });
+        if (!card) return res.status(404).json({ success: false, error: 'Gift card not found' });
+        if (card.status === 'active') return res.json({ success: true, data: card });
+
+        await db.collection('GIFT_CARDS').updateOne({ _id: new ObjectId(cardId) }, { $set: { status: 'active', updatedAt: new Date() } });
+
+        // Send gift card email
+        if (process.env.RESEND_API_KEY) {
+          try {
+            const resend  = new Resend(process.env.RESEND_API_KEY);
+            const buyer   = await db.collection('USERS').findOne({ _id: card.purchasedBy }, { projection: { firstName:1 } });
+            await resend.emails.send({
+              from:    'NXL Beauty Bar <onboarding@resend.dev>',
+              to:      card.recipientEmail,
+              subject: `🎁 You've received an NXL Beauty Bar Gift Card — R${card.amount}`,
+              html: `
+                <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:0;background:#fdf6f0;border-radius:16px;overflow:hidden;">
+                  <div style="background:linear-gradient(135deg,#3d1f15,#6b3528);padding:2.5rem 2rem;text-align:center;">
+                    <p style="color:rgba(255,232,214,0.7);font-size:0.82rem;text-transform:uppercase;letter-spacing:0.12em;margin:0 0 0.5rem;">NXL Beauty Bar</p>
+                    <h1 style="color:#ffe8d6;font-family:Georgia,serif;font-size:2rem;margin:0 0 0.5rem;">Gift Card</h1>
+                    <div style="background:rgba(255,255,255,0.1);border-radius:12px;padding:1.5rem;margin-top:1.5rem;">
+                      <p style="color:rgba(255,232,214,0.6);font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;margin:0 0 0.4rem;">Value</p>
+                      <p style="color:#ffe8d6;font-size:3rem;font-weight:800;margin:0;line-height:1;">R${card.amount}</p>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,232,214,0.2);border-radius:8px;padding:0.875rem 1.25rem;margin-top:1rem;">
+                      <p style="color:rgba(255,232,214,0.55);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.12em;margin:0 0 0.25rem;">Your Gift Code</p>
+                      <p style="color:#ffe8d6;font-family:monospace;font-size:1.3rem;font-weight:800;letter-spacing:0.15em;margin:0;">${card.code}</p>
+                    </div>
+                  </div>
+                  <div style="padding:2rem;">
+                    ${card.recipientName ? `<p style="color:#3d1f15;font-weight:700;font-size:1rem;margin:0 0 0.5rem;">Hi ${card.recipientName}!</p>` : ''}
+                    <p style="color:#6b3528;line-height:1.65;margin:0 0 0.75rem;">${buyer?.firstName ? `<strong>${buyer.firstName}</strong> has sent you` : 'You have received'} a gift card for NXL Beauty Bar!</p>
+                    ${card.message ? `<div style="background:#fff8f3;border:1px solid #e0ccc4;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1rem;font-style:italic;color:#6b3528;">"${card.message}"</div>` : ''}
+                    <p style="color:#9e7060;font-size:0.82rem;line-height:1.65;margin:0 0 1rem;">Use your gift code at checkout on our shop to redeem your gift. Valid until ${card.expiresAt.toLocaleDateString('en-ZA', { day:'numeric', month:'long', year:'numeric' })}.</p>
+                    <div style="text-align:center;margin:1.5rem 0;">
+                      <a href="${process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za'}/shop" style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.875rem 2rem;border-radius:50px;font-weight:700;font-size:0.9rem;display:inline-block;">Shop Now →</a>
+                    </div>
+                  </div>
+                </div>
+              `,
+            });
+          } catch (emailErr) { logger.error(`[GIFT CARD EMAIL] ${emailErr.message}`); }
+        }
+
+        const updated = await db.collection('GIFT_CARDS').findOne({ _id: new ObjectId(cardId) });
+        res.json({ success: true, data: updated });
+      } catch (err) { next(err); }
+    });
+
+    // POST /gift-cards/redeem — apply gift card at checkout
+    app.post('/gift-cards/redeem', authenticateToken, async (req, res, next) => {
+      try {
+        const { code, orderSubtotal } = req.body;
+        if (!code) return res.status(400).json({ success: false, error: 'Gift card code is required.' });
+
+        const card = await db.collection('GIFT_CARDS').findOne({ code: code.trim().toUpperCase() });
+        if (!card) return res.status(404).json({ success: false, error: 'Invalid gift card code.' });
+        if (card.status !== 'active') return res.status(400).json({ success: false, error: 'This gift card is not active.' });
+        if (card.balance <= 0) return res.status(400).json({ success: false, error: 'This gift card has no remaining balance.' });
+        if (new Date() > card.expiresAt) return res.status(400).json({ success: false, error: 'This gift card has expired.' });
+
+        const discount = Math.min(card.balance, orderSubtotal || card.balance);
+        res.json({
+          success: true,
+          data: {
+            code:           card.code,
+            balance:        card.balance,
+            discountAmount: parseFloat(discount.toFixed(2)),
+            remainingAfter: parseFloat((card.balance - discount).toFixed(2)),
+          },
+        });
+      } catch (err) { next(err); }
+    });
+
+    // GET /gift-cards/my — user's purchased gift cards
+    app.get('/gift-cards/my', authenticateToken, async (req, res, next) => {
+      try {
+        const cards = await db.collection('GIFT_CARDS')
+          .find({ purchasedBy: new ObjectId(req.user.userId) })
+          .sort({ createdAt: -1 }).toArray();
+        res.json({ success: true, data: cards });
+      } catch (err) { next(err); }
+    });
+
+    // GET /gift-cards/admin — admin view all gift cards
+    app.get('/gift-cards/admin', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const cards = await db.collection('GIFT_CARDS').find({}).sort({ createdAt: -1 }).limit(100).toArray();
+        res.json({ success: true, data: cards });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // GET /analytics — combined business analytics for admin dashboard
+    // ══════════════════════════════════════════════════════════════════════
+    app.get('/analytics', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const range = req.query.range || '30'; // days
+        const days  = Math.min(365, Math.max(7, parseInt(range, 10)));
+        const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1);
+
+        const [
+          // Booking stats
+          totalBookings, bookingsToday, bookingsPeriod,
+          bookingsByStatus, bookingsByService, bookingsByStaff,
+          dailyBookings,
+          // Revenue stats
+          totalRevenue, revenueToday, revenuePeriod,
+          dailyRevenue, revenueByMethod,
+          // Shop stats
+          shopRevenuePeriod, shopOrdersPeriod,
+          // Client stats
+          totalClients, newClientsPeriod, topClients,
+          // Loyalty stats
+          totalLoyaltyPoints, avgLoyaltyPoints,
+        ] = await Promise.all([
+          // Bookings
+          db.collection('APPOINTMENTS').countDocuments({}),
+          db.collection('APPOINTMENTS').countDocuments({ createdAt: { $gte: today } }),
+          db.collection('APPOINTMENTS').countDocuments({ createdAt: { $gte: since } }),
+          db.collection('APPOINTMENTS').aggregate([
+            { $group: { _id: '$status', count: { $sum: 1 } } },
+          ]).toArray(),
+          db.collection('APPOINTMENTS').aggregate([
+            { $match: { createdAt: { $gte: since } } },
+            { $unwind: '$serviceIds' },
+            { $group: { _id: '$serviceIds', count: { $sum: 1 } } },
+            { $sort: { count: -1 } }, { $limit: 8 },
+          ]).toArray(),
+          db.collection('APPOINTMENTS').aggregate([
+            { $match: { createdAt: { $gte: since } } },
+            { $group: { _id: '$employeeId', count: { $sum: 1 } } },
+            { $sort: { count: -1 } },
+          ]).toArray(),
+          db.collection('APPOINTMENTS').aggregate([
+            { $match: { createdAt: { $gte: since } } },
+            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+            { $sort: { _id: 1 } },
+          ]).toArray(),
+          // Revenue
+          db.collection('PAYMENTS').aggregate([
+            { $match: { status: 'paid' } },
+            { $group: { _id: null, total: { $sum: { $toDouble: '$amount' } } } },
+          ]).toArray(),
+          db.collection('PAYMENTS').aggregate([
+            { $match: { status: 'paid', createdAt: { $gte: today } } },
+            { $group: { _id: null, total: { $sum: { $toDouble: '$amount' } } } },
+          ]).toArray(),
+          db.collection('PAYMENTS').aggregate([
+            { $match: { status: 'paid', createdAt: { $gte: since } } },
+            { $group: { _id: null, total: { $sum: { $toDouble: '$amount' } } } },
+          ]).toArray(),
+          db.collection('PAYMENTS').aggregate([
+            { $match: { status: 'paid', createdAt: { $gte: since } } },
+            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, revenue: { $sum: { $toDouble: '$amount' } }, count: { $sum: 1 } } },
+            { $sort: { _id: 1 } },
+          ]).toArray(),
+          db.collection('PAYMENTS').aggregate([
+            { $match: { status: 'paid', createdAt: { $gte: since } } },
+            { $group: { _id: '$method', total: { $sum: { $toDouble: '$amount' } }, count: { $sum: 1 } } },
+          ]).toArray(),
+          // Shop
+          db.collection('ORDERS').aggregate([
+            { $match: { paymentStatus: 'paid', createdAt: { $gte: since } } },
+            { $group: { _id: null, total: { $sum: { $toDouble: '$totalAmount' } } } },
+          ]).toArray(),
+          db.collection('ORDERS').countDocuments({ paymentStatus: 'paid', createdAt: { $gte: since } }),
+          // Clients
+          db.collection('USERS').countDocuments({ role: 'user' }),
+          db.collection('USERS').countDocuments({ role: 'user', createdAt: { $gte: since } }),
+          db.collection('APPOINTMENTS').aggregate([
+            { $group: { _id: '$userId', bookings: { $sum: 1 } } },
+            { $sort: { bookings: -1 } }, { $limit: 5 },
+          ]).toArray(),
+          // Loyalty
+          db.collection('LOYALTY').aggregate([
+            { $group: { _id: null, total: { $sum: '$points' }, avg: { $avg: '$points' }, members: { $sum: 1 } } },
+          ]).toArray(),
+          db.collection('LOYALTY').aggregate([
+            { $group: { _id: null, avg: { $avg: '$points' } } },
+          ]).toArray(),
+        ]);
+
+        // Enrich service names
+        const serviceIds  = bookingsByService.map(b => b._id).filter(Boolean);
+        const staffIds    = bookingsByStaff.map(b => b._id).filter(Boolean);
+        const clientIds   = topClients.map(c => c._id).filter(Boolean);
+        const [services, staff, clientUsers] = await Promise.all([
+          db.collection('SERVICES').find({ _id: { $in: serviceIds } }).project({ name:1 }).toArray(),
+          db.collection('EMPLOYEES').find({ _id: { $in: staffIds } }).project({ name:1 }).toArray(),
+          db.collection('USERS').find({ _id: { $in: clientIds } }).project({ firstName:1, lastName:1, email:1 }).toArray(),
+        ]);
+        const svcMap    = Object.fromEntries(services.map(s  => [s._id.toString(), s.name]));
+        const staffMap  = Object.fromEntries(staff.map(s     => [s._id.toString(), s.name]));
+        const clientMap = Object.fromEntries(clientUsers.map(u => [u._id.toString(), u]));
+
+        const bookingStatusMap = Object.fromEntries(bookingsByStatus.map(b => [b._id, b.count]));
+        const completionRate = totalBookings > 0
+          ? Math.round(((bookingStatusMap.completed || 0) / totalBookings) * 100)
+          : 0;
+        const cancellationRate = totalBookings > 0
+          ? Math.round(((bookingStatusMap.cancelled || 0) / totalBookings) * 100)
+          : 0;
+
+        const shopRev   = shopRevenuePeriod[0]?.total || 0;
+        const bookingRev = revenuePeriod[0]?.total || 0;
+        const combinedRev = shopRev + bookingRev;
+
+        res.json({
+          success: true,
+          data: {
+            range: days,
+            // Bookings
+            bookings: {
+              total: totalBookings,
+              today: bookingsToday,
+              period: bookingsPeriod,
+              completionRate,
+              cancellationRate,
+              byStatus: bookingsByStatus,
+              byService: bookingsByService.map(b => ({ ...b, name: svcMap[b._id?.toString()] || 'Unknown' })),
+              byStaff:   bookingsByStaff.map(b => ({ ...b, name: staffMap[b._id?.toString()] || 'Unknown' })),
+              daily: dailyBookings,
+            },
+            // Revenue
+            revenue: {
+              total:    totalRevenue[0]?.total || 0,
+              today:    revenueToday[0]?.total || 0,
+              period:   bookingRev,
+              shopPeriod: shopRev,
+              combined: combinedRev,
+              daily:    dailyRevenue,
+              byMethod: revenueByMethod,
+            },
+            // Clients
+            clients: {
+              total:   totalClients,
+              newInPeriod: newClientsPeriod,
+              top: topClients.map(c => ({ ...c, user: clientMap[c._id?.toString()] })),
+            },
+            // Shop
+            shop: {
+              orders: shopOrdersPeriod,
+              revenue: shopRev,
+            },
+            // Loyalty
+            loyalty: {
+              totalPoints: totalLoyaltyPoints[0]?.total || 0,
+              avgPoints:   Math.round(totalLoyaltyPoints[0]?.avg || 0),
+              members:     totalLoyaltyPoints[0]?.members || 0,
+            },
+          },
+        });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
     // GET /shop/admin/stats — admin  ← BEFORE /:id
     app.get('/shop/admin/stats', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
       try {
@@ -1468,10 +1998,51 @@ async function startServer() {
         }
 
         const discountedSubtotal = subtotal - discountAmount;
+
+        // ── Loyalty points redemption ─────────────────────────────────────
+        let loyaltyDiscount   = 0;
+        let loyaltyPtsToRedeem = 0;
+        const { loyaltyPointsToRedeem, giftCardCode } = req.body;
+        if (loyaltyPointsToRedeem && parseInt(loyaltyPointsToRedeem) >= LOYALTY_CONFIG.minRedemption) {
+          const loyaltyAccount = await getLoyaltyAccount(new ObjectId(req.user.userId));
+          const ptsAvail  = Math.min(parseInt(loyaltyPointsToRedeem), loyaltyAccount.points);
+          const maxDisc   = discountedSubtotal * (LOYALTY_CONFIG.maxRedemptionPct / 100);
+          loyaltyDiscount  = Math.min(ptsAvail * LOYALTY_CONFIG.pointValue, maxDisc);
+          loyaltyPtsToRedeem = Math.round(loyaltyDiscount / LOYALTY_CONFIG.pointValue);
+        }
+
+        // ── Gift card redemption ──────────────────────────────────────────
+        let giftCardDiscount = 0;
+        let appliedGiftCard  = null;
+        if (giftCardCode) {
+          const card = await db.collection('GIFT_CARDS').findOne({ code: giftCardCode.trim().toUpperCase(), status: 'active' });
+          if (card && card.balance > 0 && new Date() < card.expiresAt) {
+            giftCardDiscount = Math.min(card.balance, discountedSubtotal - loyaltyDiscount);
+            appliedGiftCard  = { code: card.code, cardId: card._id, discountAmount: giftCardDiscount };
+          }
+        }
+        // ─────────────────────────────────────────────────────────────────
+
         const shippingFee = isPickup ? 0 : (discountedSubtotal >= 500 ? 0 : 80);
-        const totalAmount = discountedSubtotal + shippingFee;
+        const totalAmount = Math.max(0, discountedSubtotal - loyaltyDiscount - giftCardDiscount + shippingFee);
         const now = new Date();
-        const order = { userId:new ObjectId(req.user.userId), items:enrichedItems, fulfillmentType:isPickup?'pickup':'delivery', subtotal:Decimal128.fromString(subtotal.toFixed(2)), discountAmount:Decimal128.fromString(discountAmount.toFixed(2)), discountCode:appliedCode||null, shippingFee:Decimal128.fromString(shippingFee.toFixed(2)), totalAmount:Decimal128.fromString(totalAmount.toFixed(2)), status:'pending', paymentStatus:'unpaid', paymentMethod:'yoco', shippingAddress, notes:sanitiseText(notes||'',500), createdAt:now, updatedAt:now };
+        const order = {
+          userId: new ObjectId(req.user.userId),
+          items: enrichedItems,
+          fulfillmentType: isPickup ? 'pickup' : 'delivery',
+          subtotal:        Decimal128.fromString(subtotal.toFixed(2)),
+          discountAmount:  Decimal128.fromString(discountAmount.toFixed(2)),
+          discountCode:    appliedCode || null,
+          loyaltyDiscount: Decimal128.fromString(loyaltyDiscount.toFixed(2)),
+          loyaltyPointsRedeemed: loyaltyPtsToRedeem,
+          giftCardDiscount: Decimal128.fromString(giftCardDiscount.toFixed(2)),
+          giftCardCode:    appliedGiftCard?.code || null,
+          shippingFee:     Decimal128.fromString(shippingFee.toFixed(2)),
+          totalAmount:     Decimal128.fromString(totalAmount.toFixed(2)),
+          status: 'pending', paymentStatus: 'unpaid', paymentMethod: 'yoco',
+          shippingAddress, notes: sanitiseText(notes || '', 500),
+          createdAt: now, updatedAt: now,
+        };
         const result = await db.collection('ORDERS').insertOne(order);
         const orderId = result.insertedId.toString();
         const frontendUrl = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
@@ -1503,6 +2074,41 @@ async function startServer() {
         if (order.status === 'confirmed' && order.paymentStatus === 'paid') return res.json({ success:true, alreadyConfirmed:true, order });
         await db.collection('ORDERS').updateOne({ _id:new ObjectId(orderId) }, { $set:{ status:'confirmed', paymentStatus:'paid', updatedAt:new Date() } });
         for (const item of order.items||[]) { await db.collection('PRODUCTS').updateOne({ _id:item.productId }, { $inc:{ stock:-item.quantity } }); }
+
+        // ── Award loyalty points for shop order ───────────────────────────
+        try {
+          const amountSpent = parseFloat(order.totalAmount?.toString() || 0);
+          const earnedPts   = Math.floor(amountSpent * LOYALTY_CONFIG.pointsPerRand);
+          if (earnedPts > 0) {
+            await awardPoints(order.userId, earnedPts, `Shop order #${orderId.slice(-6).toUpperCase()}`, new ObjectId(orderId));
+          }
+          // Deduct redeemed points if any
+          if (order.loyaltyPointsRedeemed > 0) {
+            await redeemPoints(order.userId, order.loyaltyPointsRedeemed, `Redeemed at checkout — order #${orderId.slice(-6).toUpperCase()}`, new ObjectId(orderId));
+          }
+          // Deduct gift card balance
+          if (order.giftCardCode) {
+            const gcDiscount = parseFloat(order.giftCardDiscount?.toString() || 0);
+            await db.collection('GIFT_CARDS').updateOne(
+              { code: order.giftCardCode },
+              { $inc: { balance: -gcDiscount, redeemedAmount: gcDiscount },
+                $push: { redemptions: { orderId: new ObjectId(orderId), amount: gcDiscount, redeemedAt: new Date() } },
+                $set:  { status: gcDiscount >= parseFloat((await db.collection('GIFT_CARDS').findOne({ code: order.giftCardCode }))?.balance?.toString() || 0) ? 'redeemed' : 'active', updatedAt: new Date() } }
+            );
+          }
+        } catch (loyaltyErr) { logger.error(`[LOYALTY] Shop order award failed: ${loyaltyErr.message}`); }
+
+        // ── In-app: order confirmed ────────────────────────────────────────
+        try {
+          await notifyClient(order.userId, {
+            type:  'order_confirmed',
+            title: `Order #${orderId.slice(-6).toUpperCase()} Confirmed 🛒`,
+            body:  `Your order has been confirmed. ${order.fulfillmentType === 'pickup' ? "We'll notify you when it's ready to collect." : "We'll notify you when it ships."}`,
+            link:  `/track/${orderId}`,
+            meta:  { orderId },
+          });
+        } catch {}
+        // ──────────────────────────────────────────────────────────────────
 
         // ── Low stock check after deduction ────────────────────────────────
         if (process.env.RESEND_API_KEY && process.env.ADMIN_EMAIL) {
@@ -1544,6 +2150,45 @@ async function startServer() {
         res.json({ success:true, order:{ ...order, status:'confirmed', paymentStatus:'paid' } });
       } catch (err) { next(err); }
     });
+
+    // ── GET /appointments/:id/receipt — public receipt for PaymentSuccess page ──
+    app.get('/appointments/:id/receipt', async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i))
+          return res.status(400).json({ success:false, error:'Invalid ID' });
+
+        const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
+        if (!appt) return res.status(404).json({ success:false, error:'Appointment not found' });
+
+        // Verify by email query param
+        const emailParam = req.query.email?.toLowerCase()?.trim();
+        if (!emailParam) return res.status(400).json({ success:false, error:'Email required' });
+
+        const user = await db.collection('USERS').findOne({ _id: appt.userId });
+        if (!user || user.email.toLowerCase() !== emailParam)
+          return res.status(403).json({ success:false, error:'Email does not match booking' });
+
+        const svcIds = appt.serviceIds || [];
+        const [services, employee] = await Promise.all([
+          db.collection('SERVICES').find({ _id:{ $in:svcIds } }).project({ name:1, durationMinutes:1 }).toArray(),
+          appt.employeeId ? db.collection('EMPLOYEES').findOne({ _id:appt.employeeId }, { projection:{ name:1 } }) : null,
+        ]);
+        const totalDuration = services.reduce((sum, s) => sum + (s.durationMinutes || 30), 0);
+
+        res.json({ success:true, data: {
+          name:             `${user.firstName} ${user.lastName}`.trim(),
+          email:            user.email,
+          appointmentDate:  appt.date,
+          appointmentTime:  appt.time,
+          selectedServices: services.map(s => s.name),
+          selectedEmployee: employee?.name || '',
+          totalPrice:       parseFloat(appt.totalPrice?.toString() || 0),
+          totalDuration:    totalDuration || 60,
+          paymentStatus:    appt.paymentStatus,
+        }});
+      } catch (err) { next(err); }
+    });
+    // ──────────────────────────────────────────────────────────────────────
 
     // GET /shop/orders — user's own orders  ← BEFORE /shop/orders/:id
     app.get('/shop/orders', authenticateToken, async (req, res, next) => {
@@ -1673,6 +2318,9 @@ async function startServer() {
                     </div>
 
                     <p style="color:#9e7060;font-size:0.8rem;line-height:1.65;">Questions? WhatsApp us at <a href="https://wa.me/27685113394" style="color:#a0502e;">068 511 3394</a> or email <a href="mailto:nxlbeautybar@gmail.com" style="color:#a0502e;">nxlbeautybar@gmail.com</a>.</p>
+                    <div style="text-align:center;margin:1.25rem 0;">
+                      <a href="${(process.env.CORS_ORIGIN||'https://nxlbeautybar.co.za').replace(/\/$/,'')}/track/${req.params.id}" style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.75rem 1.75rem;border-radius:50px;font-weight:700;font-size:0.85rem;display:inline-block;">📦 Track Your Order →</a>
+                    </div>
                     <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
                     <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p>
                   </div>
@@ -1684,6 +2332,22 @@ async function startServer() {
             logger.error(`[SHIPPED EMAIL] Failed: ${emailErr.message}`);
           }
         }
+        // ──────────────────────────────────────────────────────────────────
+
+        // ── In-app notification for order status changes ─────────────────
+        try {
+          const notifMap = {
+            shipped:   { type:'order_shipped',   title:`Order #${req.params.id.slice(-6).toUpperCase()} Shipped 🚚`,     body:'Your order is on its way! Track it to see the latest updates.' },
+            ready:     { type:'order_ready',     title:`Order Ready to Collect 🏪`,                                       body:`Your order #${req.params.id.slice(-6).toUpperCase()} is ready for pickup at NXL Beauty Bar.` },
+            delivered: { type:'order_delivered', title:`Order #${req.params.id.slice(-6).toUpperCase()} Delivered ✅`,   body:'Your order has been delivered. Enjoy your products!' },
+            cancelled: { type:'booking_cancelled',title:`Order #${req.params.id.slice(-6).toUpperCase()} Cancelled`,     body:'Your order has been cancelled. Contact us if you have questions.' },
+            refunded:  { type:'booking_cancelled',title:`Order #${req.params.id.slice(-6).toUpperCase()} Refunded ↩️`,   body:'Your refund has been processed. It may take 3–5 business days to appear.' },
+          };
+          const n = notifMap[req.body.status];
+          if (n && order.userId) {
+            await notifyClient(order.userId, { ...n, link: `/track/${req.params.id}`, meta: { orderId: req.params.id } });
+          }
+        } catch {}
         // ──────────────────────────────────────────────────────────────────
 
         // ── Stock management on status change ────────────────────────────
@@ -1858,7 +2522,1340 @@ ${urlEntries}
     // DISCOUNT CODES
     // =====================
 
-    // POST /discount-codes/validate — public validate (used by cart before checkout)
+    // ══════════════════════════════════════════════════════════════════════
+    // LOYALTY PROGRAM
+    // ══════════════════════════════════════════════════════════════════════
+    // Config — edit these to change the program rules
+    const LOYALTY_CONFIG = {
+      pointsPerRand:      1,      // 1 point per R1 spent
+      bookingBonus:       50,     // extra points for completing a booking
+      signupBonus:        100,    // points on first registration
+      pointValue:         0.10,   // 1 point = R0.10 discount (100 pts = R10)
+      minRedemption:      100,    // minimum points to redeem
+      maxRedemptionPct:   50,     // max % of order value that can be paid with points
+    };
+
+    // ── Helper: get or create loyalty account ─────────────────────────────
+    async function getLoyaltyAccount(userId) {
+      let account = await db.collection('LOYALTY').findOne({ userId });
+      if (!account) {
+        const now = new Date();
+        const res = await db.collection('LOYALTY').insertOne({
+          userId, points: 0, totalEarned: 0, totalRedeemed: 0,
+          tier: 'bronze', createdAt: now, updatedAt: now,
+        });
+        account = { _id: res.insertedId, userId, points: 0, totalEarned: 0, totalRedeemed: 0, tier: 'bronze' };
+      }
+      return account;
+    }
+
+    // ── Helper: calculate tier ─────────────────────────────────────────────
+    function calcTier(totalEarned) {
+      if (totalEarned >= 5000) return 'platinum';
+      if (totalEarned >= 2000) return 'gold';
+      if (totalEarned >= 500)  return 'silver';
+      return 'bronze';
+    }
+
+    // ── Helper: award points ───────────────────────────────────────────────
+    async function awardPoints(userId, points, reason, referenceId = null) {
+      if (points <= 0) return;
+      const now = new Date();
+      await db.collection('LOYALTY_TRANSACTIONS').insertOne({
+        userId, points, type: 'earn', reason, referenceId, createdAt: now,
+      });
+      const account = await getLoyaltyAccount(userId);
+      const newTotal = account.totalEarned + points;
+      const oldTier  = account.tier;
+      const newTier  = calcTier(newTotal);
+      await db.collection('LOYALTY').updateOne(
+        { userId },
+        { $inc: { points, totalEarned: points }, $set: { tier: newTier, updatedAt: now } }
+      );
+      logger.info(`[LOYALTY] +${points} pts to user ${userId} — ${reason}`);
+
+      // Tier-up notification
+      if (newTier !== oldTier) {
+        const tierEmojis = { silver:'🥈', gold:'🥇', platinum:'💎' };
+        await notifyClient(userId, {
+          type:  'loyalty_tier_up',
+          title: `You've reached ${newTier.charAt(0).toUpperCase() + newTier.slice(1)} tier! ${tierEmojis[newTier]||'🏆'}`,
+          body:  `Congratulations! You've unlocked ${newTier} member status. Keep earning points for exclusive perks.`,
+          link:  '/profile',
+          meta:  { tier: newTier },
+        });
+      }
+    }
+
+    // ── Helper: redeem points ──────────────────────────────────────────────
+    async function redeemPoints(userId, points, reason, referenceId = null) {
+      if (points <= 0) return;
+      const now = new Date();
+      await db.collection('LOYALTY_TRANSACTIONS').insertOne({
+        userId, points: -points, type: 'redeem', reason, referenceId, createdAt: now,
+      });
+      await db.collection('LOYALTY').updateOne(
+        { userId },
+        { $inc: { points: -points, totalRedeemed: points }, $set: { updatedAt: now } }
+      );
+      logger.info(`[LOYALTY] -${points} pts from user ${userId} — ${reason}`);
+    }
+
+    // ── GET /loyalty/me — get current user's loyalty account ──────────────
+    app.get('/loyalty/me', authenticateToken, async (req, res, next) => {
+      try {
+        const userId  = new ObjectId(req.user.userId);
+        const account = await getLoyaltyAccount(userId);
+        const txns    = await db.collection('LOYALTY_TRANSACTIONS')
+          .find({ userId })
+          .sort({ createdAt: -1 })
+          .limit(20)
+          .toArray();
+        const randValue = (account.points * LOYALTY_CONFIG.pointValue).toFixed(2);
+        res.json({
+          success: true,
+          data: {
+            ...account,
+            randValue,
+            config: {
+              pointValue:      LOYALTY_CONFIG.pointValue,
+              minRedemption:   LOYALTY_CONFIG.minRedemption,
+              maxRedemptionPct: LOYALTY_CONFIG.maxRedemptionPct,
+            },
+            transactions: txns,
+          },
+        });
+      } catch (err) { next(err); }
+    });
+
+    // ── POST /loyalty/redeem — validate & reserve points for checkout ──────
+    app.post('/loyalty/redeem', authenticateToken, async (req, res, next) => {
+      try {
+        const { pointsToRedeem, orderSubtotal } = req.body;
+        const userId  = new ObjectId(req.user.userId);
+        const account = await getLoyaltyAccount(userId);
+
+        if (!pointsToRedeem || pointsToRedeem < LOYALTY_CONFIG.minRedemption)
+          return res.status(400).json({ success: false, error: `Minimum redemption is ${LOYALTY_CONFIG.minRedemption} points.` });
+
+        if (pointsToRedeem > account.points)
+          return res.status(400).json({ success: false, error: 'Insufficient points.' });
+
+        const maxDiscount = (orderSubtotal || 0) * (LOYALTY_CONFIG.maxRedemptionPct / 100);
+        const discount    = Math.min(pointsToRedeem * LOYALTY_CONFIG.pointValue, maxDiscount);
+        const finalPoints = Math.round(discount / LOYALTY_CONFIG.pointValue);
+
+        res.json({
+          success: true,
+          data: {
+            pointsRedeemed: finalPoints,
+            discountAmount: parseFloat(discount.toFixed(2)),
+            remainingPoints: account.points - finalPoints,
+          },
+        });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /loyalty/admin/:userId — admin view user loyalty ──────────────
+    app.get('/loyalty/admin/:userId', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const userId  = new ObjectId(req.params.userId);
+        const account = await getLoyaltyAccount(userId);
+        const txns    = await db.collection('LOYALTY_TRANSACTIONS')
+          .find({ userId }).sort({ createdAt: -1 }).limit(50).toArray();
+        res.json({ success: true, data: { ...account, transactions: txns } });
+      } catch (err) { next(err); }
+    });
+
+    // ── POST /loyalty/admin/adjust — admin manually adjust points ─────────
+    app.post('/loyalty/admin/adjust', authenticateToken, authorizeRole('admin'),
+      body('userId').isMongoId(),
+      body('points').isInt(),
+      body('reason').isString().notEmpty(),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+          const userId = new ObjectId(req.body.userId);
+          const pts    = parseInt(req.body.points, 10);
+          if (pts > 0) await awardPoints(userId, pts, `Admin adjustment: ${req.body.reason}`);
+          else if (pts < 0) {
+            const account = await getLoyaltyAccount(userId);
+            const deduct  = Math.min(Math.abs(pts), account.points);
+            await redeemPoints(userId, deduct, `Admin adjustment: ${req.body.reason}`);
+          }
+          const updated = await getLoyaltyAccount(userId);
+          res.json({ success: true, data: updated });
+        } catch (err) { next(err); }
+      }
+    );
+
+    // ── GET /loyalty/admin/leaderboard — top 20 members ───────────────────
+    app.get('/loyalty/leaderboard', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const top = await db.collection('LOYALTY').find({})
+          .sort({ totalEarned: -1 }).limit(20).toArray();
+        const userIds = top.map(t => t.userId);
+        const users   = await db.collection('USERS').find({ _id: { $in: userIds } })
+          .project({ firstName:1, lastName:1, email:1 }).toArray();
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+        const result  = top.map(t => ({
+          ...t,
+          user: userMap[t.userId.toString()],
+          randValue: (t.points * LOYALTY_CONFIG.pointValue).toFixed(2),
+        }));
+        res.json({ success: true, data: result });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── POST /appointments/:id/whatsapp-reminder — manual WhatsApp send ───
+    app.post('/appointments/:id/whatsapp-reminder', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id) });
+        if (!appt) return res.status(404).json({ success:false, error:'Appointment not found' });
+        const client = await db.collection('USERS').findOne({ _id: appt.userId });
+        const phone  = client?.phone || req.body.phone;
+        if (!phone) return res.status(400).json({ success:false, error:'No phone number on file. Provide phone in request body.' });
+
+        const services = await db.collection('SERVICES').find({ _id: { $in: appt.serviceIds || [] } }).project({ name:1 }).toArray();
+        const svcNames = services.map(s => s.name).join(', ') || 'your appointment';
+        const text = `Hi ${client?.firstName || 'there'}! 👋 This is a reminder from NXL Beauty Bar. You have an appointment for ${svcNames} on ${appt.date} at ${appt.time}. 📍 1948 Mahalefele Rd, Dube, Soweto. Please arrive 5 mins early. See you soon! 💅`;
+        const waUrl = `https://wa.me/${phone.replace(/\D/g,'')}?text=${encodeURIComponent(text)}`;
+
+        res.json({ success:true, data:{ waUrl, phone, message: text } });
+      } catch (err) { next(err); }
+    });
+    // ──────────────────────────────────────────────────────────────────────
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SUBSCRIPTION PACKAGES
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── GET /subscription-plans — public list of available plans ──────────
+    app.get('/subscription-plans', async (req, res, next) => {
+      try {
+        const plans = await db.collection('SUBSCRIPTION_PLANS')
+          .find({ isActive: true })
+          .sort({ sortOrder: 1, price: 1 })
+          .toArray();
+        res.json({ success: true, data: plans.map(p => ({ ...p, price: parseFloat(p.price?.toString() || 0) })) });
+      } catch (err) { next(err); }
+    });
+
+    // ── CRUD for plans (admin) ─────────────────────────────────────────────
+    app.post('/subscription-plans', authenticateToken, authorizeRole('admin'),
+      body('name').isString().notEmpty(),
+      body('price').isFloat({ min: 0 }),
+      body('bookingsPerMonth').isInt({ min: 1 }),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+          const { name, description, price, bookingsPerMonth, discountPct, features, color, isPopular, sortOrder } = req.body;
+          const plan = {
+            name: sanitiseText(name, 80),
+            description: sanitiseText(description || '', 300),
+            price: Decimal128.fromString(parseFloat(price).toFixed(2)),
+            bookingsPerMonth: parseInt(bookingsPerMonth),
+            discountPct: discountPct ? parseInt(discountPct) : 0,
+            features: Array.isArray(features) ? features.map(f => sanitiseText(f, 100)) : [],
+            color: color || '#6366f1',
+            isPopular: !!isPopular,
+            sortOrder: sortOrder || 0,
+            isActive: true,
+            subscriberCount: 0,
+            createdAt: new Date(), updatedAt: new Date(),
+          };
+          const result = await db.collection('SUBSCRIPTION_PLANS').insertOne(plan);
+          res.status(201).json({ success: true, data: { _id: result.insertedId, ...plan } });
+        } catch (err) { next(err); }
+      }
+    );
+
+    app.put('/subscription-plans/:id', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        const allowed = ['name','description','price','bookingsPerMonth','discountPct','features','color','isPopular','isActive','sortOrder'];
+        const update  = {};
+        allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
+        if (update.price) update.price = Decimal128.fromString(parseFloat(update.price).toFixed(2));
+        update.updatedAt = new Date();
+        await db.collection('SUBSCRIPTION_PLANS').updateOne({ _id: new ObjectId(req.params.id) }, { $set: update });
+        const updated = await db.collection('SUBSCRIPTION_PLANS').findOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true, data: updated });
+      } catch (err) { next(err); }
+    });
+
+    app.delete('/subscription-plans/:id', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        // Soft delete — don't delete if active subscribers
+        const activeCount = await db.collection('SUBSCRIPTIONS').countDocuments({ planId: new ObjectId(req.params.id), status: 'active' });
+        if (activeCount > 0) return res.status(400).json({ success:false, error:`Cannot delete — ${activeCount} active subscriber(s). Deactivate the plan instead.` });
+        await db.collection('SUBSCRIPTION_PLANS').updateOne({ _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+        res.json({ success: true });
+      } catch (err) { next(err); }
+    });
+
+    // ── POST /subscriptions — subscribe to a plan ──────────────────────────
+    app.post('/subscriptions', authenticateToken, async (req, res, next) => {
+      try {
+        const { planId } = req.body;
+        if (!planId?.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid plan ID' });
+
+        const userId = new ObjectId(req.user.userId);
+        const plan   = await db.collection('SUBSCRIPTION_PLANS').findOne({ _id: new ObjectId(planId), isActive: true });
+        if (!plan) return res.status(404).json({ success:false, error:'Plan not found or no longer available' });
+
+        // Check for existing active subscription
+        const existing = await db.collection('SUBSCRIPTIONS').findOne({ userId, status: 'active' });
+        if (existing) return res.status(409).json({ success:false, error:'You already have an active subscription. Cancel it before subscribing to a new plan.' });
+
+        const planPrice = parseFloat(plan.price?.toString() || 0);
+        const frontendUrl = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
+
+        // Create pending subscription
+        const now = new Date();
+        const renewalDate = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+        const sub = {
+          userId, planId: new ObjectId(planId),
+          planName: plan.name, planPrice: plan.price,
+          status: 'pending_payment',
+          bookingsRemaining: plan.bookingsPerMonth,
+          bookingsPerMonth:  plan.bookingsPerMonth,
+          renewalDate, startDate: now,
+          autoRenew: true,
+          payments: [],
+          createdAt: now, updatedAt: now,
+        };
+        const result = await db.collection('SUBSCRIPTIONS').insertOne(sub);
+        const subId  = result.insertedId.toString();
+
+        // Create Yoco checkout
+        const yocoResp = await fetchFn('https://payments.yoco.com/api/checkouts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.YOCO_SECRET_KEY}` },
+          body: JSON.stringify({
+            amount:     Math.round(planPrice * 100),
+            currency:   'ZAR',
+            successUrl: `${frontendUrl}/subscriptions/success?subId=${subId}`,
+            cancelUrl:  `${frontendUrl}/subscriptions?cancelled=true`,
+            metadata:   { subId, type: 'subscription', userId: req.user.userId, planId },
+          }),
+        });
+        const yocoData = await yocoResp.json();
+        if (!yocoData.redirectUrl) return res.status(500).json({ success:false, error:'Payment init failed.' });
+
+        await db.collection('SUBSCRIPTIONS').updateOne({ _id: result.insertedId }, { $set: { yocoCheckoutId: yocoData.id, updatedAt: new Date() } });
+        res.json({ success: true, data: { subId, checkoutUrl: yocoData.redirectUrl } });
+      } catch (err) { next(err); }
+    });
+
+    // ── POST /subscriptions/confirm — called after successful Yoco payment ──
+    app.post('/subscriptions/confirm', authenticateToken, async (req, res, next) => {
+      try {
+        const { subId } = req.body;
+        if (!subId?.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid subscription ID' });
+
+        const sub = await db.collection('SUBSCRIPTIONS').findOne({ _id: new ObjectId(subId) });
+        if (!sub) return res.status(404).json({ success:false, error:'Subscription not found' });
+        if (sub.status === 'active') return res.json({ success: true, data: sub }); // already confirmed
+
+        const now = new Date();
+        await db.collection('SUBSCRIPTIONS').updateOne(
+          { _id: new ObjectId(subId) },
+          {
+            $set:  { status: 'active', activatedAt: now, updatedAt: now },
+            $push: { payments: { amount: parseFloat(sub.planPrice?.toString() || 0), date: now, type: 'initial' } },
+          }
+        );
+
+        // Increment subscriber count on plan
+        await db.collection('SUBSCRIPTION_PLANS').updateOne({ _id: sub.planId }, { $inc: { subscriberCount: 1 } });
+
+        // Award loyalty points for subscribing
+        try { await awardPoints(sub.userId, 100, `Subscribed to ${sub.planName}`); } catch {}
+
+        // In-app notification
+        try {
+          await notifyClient(sub.userId, {
+            type:  'order_confirmed',
+            title: `${sub.planName} Subscription Active! 💅`,
+            body:  `Your subscription is now active. You have ${sub.bookingsPerMonth} bookings this month. Book anytime!`,
+            link:  '/profile',
+          });
+        } catch {}
+
+        // Confirmation email
+        if (process.env.RESEND_API_KEY) {
+          try {
+            const resend = new Resend(process.env.RESEND_API_KEY);
+            const user   = await db.collection('USERS').findOne({ _id: sub.userId }, { projection:{ email:1, firstName:1 } });
+            if (user?.email) {
+              await resend.emails.send({
+                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                to:      user.email,
+                subject: `Your ${sub.planName} Subscription is Active! 💅`,
+                html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
+                  <h2 style="font-family:Georgia,serif;color:#3d1f15;">NXL Beauty Bar</h2>
+                  <h3 style="color:#6b3528;">Subscription Confirmed! 💅</h3>
+                  <p>Hi ${user.firstName},</p>
+                  <p>Your <strong>${sub.planName}</strong> subscription is now active.</p>
+                  <div style="background:#fff8f3;border:1px solid #e0ccc4;border-radius:10px;padding:1rem;margin:1rem 0;">
+                    <p style="margin:0;font-size:0.85rem;color:#6b3528;"><strong>📅 Bookings this month:</strong> ${sub.bookingsPerMonth}</p>
+                    <p style="margin:0.5rem 0 0;font-size:0.85rem;color:#6b3528;"><strong>🔄 Renewal date:</strong> ${new Date(sub.renewalDate).toLocaleDateString('en-ZA', { day:'numeric', month:'long', year:'numeric' })}</p>
+                  </div>
+                  <p>Book your appointments at <a href="${process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za'}" style="color:#a0502e;">nxlbeautybar.co.za</a></p>
+                </div>`,
+              });
+            }
+          } catch (emailErr) { logger.error(`[SUB EMAIL] ${emailErr.message}`); }
+        }
+
+        const updated = await db.collection('SUBSCRIPTIONS').findOne({ _id: new ObjectId(subId) });
+        res.json({ success: true, data: updated });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /subscriptions/my — current user's subscription ───────────────
+    app.get('/subscriptions/my', authenticateToken, async (req, res, next) => {
+      try {
+        const userId = new ObjectId(req.user.userId);
+        const sub    = await db.collection('SUBSCRIPTIONS').findOne({ userId, status: { $in: ['active', 'pending_payment', 'past_due'] } });
+        if (!sub) return res.json({ success: true, data: null });
+
+        const plan = await db.collection('SUBSCRIPTION_PLANS').findOne({ _id: sub.planId });
+        res.json({
+          success: true,
+          data: { ...sub, planPrice: parseFloat(sub.planPrice?.toString() || 0), plan },
+        });
+      } catch (err) { next(err); }
+    });
+
+    // ── POST /subscriptions/:id/cancel — cancel subscription ──────────────
+    app.post('/subscriptions/:id/cancel', authenticateToken, async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+
+        const sub = await db.collection('SUBSCRIPTIONS').findOne({ _id: new ObjectId(req.params.id) });
+        if (!sub) return res.status(404).json({ success:false, error:'Subscription not found' });
+
+        // Only owner or admin can cancel
+        if (req.user.role !== 'admin' && String(sub.userId) !== String(req.user.userId))
+          return res.status(403).json({ success:false, error:'Not authorized' });
+
+        await db.collection('SUBSCRIPTIONS').updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { status: 'cancelled', cancelledAt: new Date(), autoRenew: false, updatedAt: new Date() } }
+        );
+
+        // Decrement subscriber count
+        await db.collection('SUBSCRIPTION_PLANS').updateOne({ _id: sub.planId }, { $inc: { subscriberCount: -1 } });
+
+        // Notify user
+        try {
+          await notifyClient(sub.userId, {
+            type:  'booking_cancelled',
+            title: 'Subscription Cancelled',
+            body:  `Your ${sub.planName} subscription has been cancelled. Your remaining ${sub.bookingsRemaining} booking credits are still valid until ${new Date(sub.renewalDate).toLocaleDateString('en-ZA')}.`,
+            link:  '/subscriptions',
+          });
+        } catch {}
+
+        res.json({ success: true });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /subscriptions/admin — admin view all subscriptions ───────────
+    app.get('/subscriptions/admin', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const { status } = req.query;
+        const filter = status && status !== 'all' ? { status } : {};
+        const page   = Math.max(1, parseInt(req.query.page || '1'));
+        const limit  = Math.min(100, parseInt(req.query.limit || '50'));
+
+        const [subs, total] = await Promise.all([
+          db.collection('SUBSCRIPTIONS').find(filter).sort({ createdAt:-1 }).skip((page-1)*limit).limit(limit).toArray(),
+          db.collection('SUBSCRIPTIONS').countDocuments(filter),
+        ]);
+
+        const userIds = [...new Set(subs.map(s => s.userId))];
+        const users   = await db.collection('USERS').find({ _id: { $in: userIds } }).project({ firstName:1, lastName:1, email:1, phone:1 }).toArray();
+        const uMap    = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+
+        const enriched = subs.map(s => ({
+          ...s,
+          planPrice: parseFloat(s.planPrice?.toString() || 0),
+          user: uMap[s.userId?.toString()],
+        }));
+
+        // Stats
+        const stats = {
+          active:    await db.collection('SUBSCRIPTIONS').countDocuments({ status: 'active' }),
+          cancelled: await db.collection('SUBSCRIPTIONS').countDocuments({ status: 'cancelled' }),
+          total:     await db.collection('SUBSCRIPTIONS').countDocuments({}),
+          mrr:       (await db.collection('SUBSCRIPTIONS').aggregate([
+            { $match: { status: 'active' } },
+            { $group: { _id: null, total: { $sum: { $toDouble: '$planPrice' } } } },
+          ]).toArray())[0]?.total || 0,
+        };
+
+        res.json({ success:true, data: enriched, stats, total, page, pages: Math.ceil(total/limit) });
+      } catch (err) { next(err); }
+    });
+
+    // ── POST /subscriptions/:id/use-credit — deduct a booking credit ───────
+    app.post('/subscriptions/:id/use-credit', authenticateToken, async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+
+        const sub = await db.collection('SUBSCRIPTIONS').findOne({
+          _id: new ObjectId(req.params.id),
+          userId: new ObjectId(req.user.userId),
+          status: 'active',
+        });
+        if (!sub) return res.status(404).json({ success:false, error:'Active subscription not found' });
+        if (sub.bookingsRemaining <= 0) return res.status(400).json({ success:false, error:'No booking credits remaining this month.' });
+
+        await db.collection('SUBSCRIPTIONS').updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $inc: { bookingsRemaining: -1 }, $set: { updatedAt: new Date() } }
+        );
+
+        res.json({ success: true, data: { bookingsRemaining: sub.bookingsRemaining - 1 } });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // REFERRAL PROGRAM
+    // ══════════════════════════════════════════════════════════════════════
+
+    const REFERRAL_CONFIG = {
+      referrerPoints:    200,   // points awarded to referrer when friend books
+      refereeDiscount:   50,    // rand discount for the new friend's first order
+      signupBonus:       50,    // extra points to referrer on friend signup
+      maxReferrals:      null,  // null = unlimited
+    };
+
+    // Helper: generate unique referral code
+    async function generateReferralCode(userId) {
+      const base    = userId.toString().slice(-4).toUpperCase();
+      const chars   = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      let code;
+      let attempts = 0;
+      do {
+        const rand = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+        code = `NXL${base}${rand}`;
+        attempts++;
+      } while (attempts < 10 && await db.collection('USERS').findOne({ referralCode: code }));
+      return code;
+    }
+
+    // Helper: get or create referral code for a user
+    async function getOrCreateReferralCode(userId) {
+      const user = await db.collection('USERS').findOne({ _id: userId }, { projection: { referralCode: 1 } });
+      if (user?.referralCode) return user.referralCode;
+      const code = await generateReferralCode(userId);
+      await db.collection('USERS').updateOne({ _id: userId }, { $set: { referralCode: code, updatedAt: new Date() } });
+      return code;
+    }
+
+    // GET /referrals/my — get current user's referral info + stats
+    app.get('/referrals/my', authenticateToken, async (req, res, next) => {
+      try {
+        const userId = new ObjectId(req.user.userId);
+        const code   = await getOrCreateReferralCode(userId);
+
+        const [referrals, pendingCount, completedCount] = await Promise.all([
+          db.collection('REFERRALS')
+            .find({ referrerId: userId })
+            .sort({ createdAt: -1 })
+            .limit(20)
+            .toArray(),
+          db.collection('REFERRALS').countDocuments({ referrerId: userId, status: 'signed_up' }),
+          db.collection('REFERRALS').countDocuments({ referrerId: userId, status: 'rewarded' }),
+        ]);
+
+        const totalPointsEarned = referrals
+          .filter(r => r.status === 'rewarded')
+          .reduce((sum, r) => sum + (r.pointsAwarded || 0), 0);
+
+        // Enrich with referee names
+        const refereeIds = referrals.map(r => r.refereeId).filter(Boolean);
+        const referees   = await db.collection('USERS').find({ _id: { $in: refereeIds } })
+          .project({ firstName: 1, lastName: 1 }).toArray();
+        const refereeMap = Object.fromEntries(referees.map(u => [u._id.toString(), u]));
+
+        const enriched = referrals.map(r => ({
+          ...r,
+          refereeName: r.refereeId ? `${refereeMap[r.refereeId.toString()]?.firstName || ''} ${refereeMap[r.refereeId.toString()]?.lastName || ''}`.trim() || 'Friend' : 'Pending',
+        }));
+
+        const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
+
+        res.json({
+          success: true,
+          data: {
+            referralCode: code,
+            referralUrl:  `${frontendUrl}/signup?ref=${code}`,
+            stats: {
+              totalReferrals:     referrals.length,
+              pendingReferrals:   pendingCount,
+              completedReferrals: completedCount,
+              totalPointsEarned,
+            },
+            config: REFERRAL_CONFIG,
+            referrals: enriched,
+          },
+        });
+      } catch (err) { next(err); }
+    });
+
+    // POST /referrals/validate — check a referral code (called on signup page)
+    app.post('/referrals/validate', async (req, res, next) => {
+      try {
+        const { code } = req.body;
+        if (!code) return res.status(400).json({ success: false, error: 'Code required' });
+
+        const referrer = await db.collection('USERS').findOne(
+          { referralCode: code.trim().toUpperCase() },
+          { projection: { firstName: 1, lastName: 1 } }
+        );
+        if (!referrer) return res.status(404).json({ success: false, error: 'Invalid referral code.' });
+
+        res.json({
+          success: true,
+          data: {
+            valid:        true,
+            referrerName: `${referrer.firstName} ${referrer.lastName}`,
+            discount:     REFERRAL_CONFIG.refereeDiscount,
+            message:      `You were referred by ${referrer.firstName}! You'll get a R${REFERRAL_CONFIG.refereeDiscount} discount on your first order.`,
+          },
+        });
+      } catch (err) { next(err); }
+    });
+
+    // GET /referrals/admin — admin view all referrals
+    app.get('/referrals/admin', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const page  = Math.max(1, parseInt(req.query.page || '1'));
+        const limit = Math.min(100, parseInt(req.query.limit || '50'));
+        const referrals = await db.collection('REFERRALS').find({}).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).toArray();
+        const total     = await db.collection('REFERRALS').countDocuments({});
+
+        // Enrich
+        const allIds = [...new Set([...referrals.map(r=>r.referrerId), ...referrals.map(r=>r.refereeId)].filter(Boolean))];
+        const users  = await db.collection('USERS').find({ _id:{ $in:allIds } }).project({ firstName:1, lastName:1, email:1 }).toArray();
+        const uMap   = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+
+        const enriched = referrals.map(r => ({
+          ...r,
+          referrer: uMap[r.referrerId?.toString()],
+          referee:  r.refereeId ? uMap[r.refereeId.toString()] : null,
+        }));
+
+        res.json({ success:true, data:enriched, total, page, pages:Math.ceil(total/limit) });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // CLIENT NOTIFICATIONS — in-app notification centre for customers
+    // ══════════════════════════════════════════════════════════════════════
+
+    // Notification types:
+    // booking_confirmed, booking_cancelled, booking_reminder,
+    // order_confirmed, order_shipped, order_ready, order_delivered,
+    // loyalty_earned, loyalty_redeemed, loyalty_tier_up,
+    // gift_card_received, promotion, system
+
+    const NOTIF_ICONS = {
+      booking_confirmed:  '📅',
+      booking_cancelled:  '❌',
+      booking_reminder:   '⏰',
+      order_confirmed:    '🛒',
+      order_shipped:      '🚚',
+      order_ready:        '🏪',
+      order_delivered:    '✅',
+      loyalty_earned:     '⭐',
+      loyalty_redeemed:   '🎁',
+      loyalty_tier_up:    '🏆',
+      gift_card_received: '🎁',
+      promotion:          '🎉',
+      system:             '💡',
+    };
+
+    // Helper: create a client notification
+    async function notifyClient(userId, { type, title, body, link = null, meta = {} }) {
+      try {
+        await db.collection('CLIENT_NOTIFICATIONS').insertOne({
+          userId: typeof userId === 'string' ? new ObjectId(userId) : userId,
+          type, title, body,
+          icon:  NOTIF_ICONS[type] || '🔔',
+          link,  meta,
+          read:  false, readAt: null,
+          createdAt: new Date(),
+        });
+      } catch (err) {
+        logger.error(`[CLIENT NOTIF] Failed to create notification: ${err.message}`);
+      }
+    }
+
+    // GET /client-notifications — get current user's notifications
+    app.get('/client-notifications', authenticateToken, async (req, res, next) => {
+      try {
+        const userId = new ObjectId(req.user.userId);
+        const page   = Math.max(1, parseInt(req.query.page || '1'));
+        const limit  = Math.min(50, parseInt(req.query.limit || '20'));
+
+        const [notifications, total, unreadCount] = await Promise.all([
+          db.collection('CLIENT_NOTIFICATIONS')
+            .find({ userId })
+            .sort({ createdAt: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray(),
+          db.collection('CLIENT_NOTIFICATIONS').countDocuments({ userId }),
+          db.collection('CLIENT_NOTIFICATIONS').countDocuments({ userId, read: false }),
+        ]);
+
+        res.json({
+          success: true,
+          data: notifications,
+          total, unreadCount,
+          page,
+          pages: Math.ceil(total / limit),
+        });
+      } catch (err) { next(err); }
+    });
+
+    // GET /client-notifications/unread-count — lightweight poll
+    app.get('/client-notifications/unread-count', authenticateToken, async (req, res, next) => {
+      try {
+        const userId = new ObjectId(req.user.userId);
+        const count  = await db.collection('CLIENT_NOTIFICATIONS').countDocuments({ userId, read: false });
+        res.json({ success: true, data: { count } });
+      } catch (err) { next(err); }
+    });
+
+    // POST /client-notifications/mark-read — mark one or all as read
+    app.post('/client-notifications/mark-read', authenticateToken, async (req, res, next) => {
+      try {
+        const userId = new ObjectId(req.user.userId);
+        const { id } = req.body; // if id provided, mark single; else mark all
+
+        if (id && id.match(/^[a-f\d]{24}$/i)) {
+          await db.collection('CLIENT_NOTIFICATIONS').updateOne(
+            { _id: new ObjectId(id), userId },
+            { $set: { read: true, readAt: new Date() } }
+          );
+        } else {
+          await db.collection('CLIENT_NOTIFICATIONS').updateMany(
+            { userId, read: false },
+            { $set: { read: true, readAt: new Date() } }
+          );
+        }
+        res.json({ success: true });
+      } catch (err) { next(err); }
+    });
+
+    // DELETE /client-notifications/:id — delete one notification
+    app.delete('/client-notifications/:id', authenticateToken, async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i))
+          return res.status(400).json({ success: false, error: 'Invalid ID' });
+        await db.collection('CLIENT_NOTIFICATIONS').deleteOne({
+          _id: new ObjectId(req.params.id),
+          userId: new ObjectId(req.user.userId),
+        });
+        res.json({ success: true });
+      } catch (err) { next(err); }
+    });
+
+    // DELETE /client-notifications — clear all for user
+    app.delete('/client-notifications', authenticateToken, async (req, res, next) => {
+      try {
+        await db.collection('CLIENT_NOTIFICATIONS').deleteMany({ userId: new ObjectId(req.user.userId) });
+        res.json({ success: true });
+      } catch (err) { next(err); }
+    });
+
+    // POST /client-notifications/admin-send — admin broadcast to all or specific user
+    app.post('/client-notifications/admin-send', authenticateToken, authorizeRole('admin'),
+      body('title').isString().notEmpty(),
+      body('body').isString().notEmpty(),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+
+          const { title, body: msgBody, type = 'promotion', link, userId: targetUserId } = req.body;
+
+          if (targetUserId?.match(/^[a-f\d]{24}$/i)) {
+            // Single user
+            await notifyClient(new ObjectId(targetUserId), { type, title, body: msgBody, link });
+            res.json({ success: true, data: { sent: 1 } });
+          } else {
+            // All users
+            const users = await db.collection('USERS').find({ role: 'user', isActive: { $ne: false } }).project({ _id: 1 }).toArray();
+            await Promise.all(users.map(u => notifyClient(u._id, { type, title, body: msgBody, link })));
+            res.json({ success: true, data: { sent: users.length } });
+          }
+        } catch (err) { next(err); }
+      }
+    );
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // CLIENT GALLERY — before/after photos
+    // ══════════════════════════════════════════════════════════════════════
+
+    // POST /client-gallery — client submits before/after photo
+    app.post('/client-gallery', authenticateToken,
+      body('afterImageUrl').isURL(),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+
+          const { afterImageUrl, beforeImageUrl, appointmentId, caption, serviceNames, rating } = req.body;
+          const userId = new ObjectId(req.user.userId);
+
+          // Verify appointment belongs to this user
+          let appt = null;
+          if (appointmentId?.match(/^[a-f\d]{24}$/i)) {
+            appt = await db.collection('APPOINTMENTS').findOne({ _id:new ObjectId(appointmentId), userId, status:'completed' });
+          }
+
+          const user = await db.collection('USERS').findOne({ _id: userId }, { projection:{ firstName:1, lastName:1 } });
+
+          const post = {
+            userId,
+            appointmentId:  appt ? new ObjectId(appointmentId) : null,
+            afterImageUrl,
+            beforeImageUrl: beforeImageUrl || null,
+            caption:        sanitiseText(caption || '', 200),
+            serviceNames:   Array.isArray(serviceNames) ? serviceNames : [],
+            rating:         rating ? Math.min(5, Math.max(1, parseInt(rating))) : null,
+            clientName:     `${user?.firstName || ''} ${user?.lastName || ''}`.trim() || 'Anonymous',
+            status:         'pending',  // admin must approve before it shows publicly
+            likes:          0,
+            createdAt:      new Date(),
+          };
+
+          const result = await db.collection('CLIENT_GALLERY').insertOne(post);
+
+          // Notify admin
+          await db.collection('NOTIFICATIONS').insertOne({
+            message:   `New before/after photo submitted by ${post.clientName} — pending approval`,
+            target:    'staff', read: false, createdAt: new Date(),
+          });
+
+          res.status(201).json({ success:true, data:{ _id:result.insertedId, status:'pending' } });
+        } catch (err) { next(err); }
+      }
+    );
+
+    // GET /client-gallery/public — approved posts for public display
+    app.get('/client-gallery/public', async (req, res, next) => {
+      try {
+        const page  = Math.max(1, parseInt(req.query.page || '1'));
+        const limit = Math.min(50, parseInt(req.query.limit || '12'));
+        const posts = await db.collection('CLIENT_GALLERY')
+          .find({ status:'approved' })
+          .sort({ createdAt:-1 })
+          .skip((page-1)*limit).limit(limit)
+          .toArray();
+        const total = await db.collection('CLIENT_GALLERY').countDocuments({ status:'approved' });
+        res.json({ success:true, data:posts, total, page, pages:Math.ceil(total/limit) });
+      } catch (err) { next(err); }
+    });
+
+    // GET /client-gallery/my — user's own submissions
+    app.get('/client-gallery/my', authenticateToken, async (req, res, next) => {
+      try {
+        const posts = await db.collection('CLIENT_GALLERY')
+          .find({ userId: new ObjectId(req.user.userId) })
+          .sort({ createdAt:-1 }).limit(20).toArray();
+        res.json({ success:true, data:posts });
+      } catch (err) { next(err); }
+    });
+
+    // GET /client-gallery/admin — admin view all submissions
+    app.get('/client-gallery/admin', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const { status } = req.query;
+        const filter = status && status !== 'all' ? { status } : {};
+        const posts  = await db.collection('CLIENT_GALLERY').find(filter).sort({ createdAt:-1 }).limit(100).toArray();
+        res.json({ success:true, data:posts });
+      } catch (err) { next(err); }
+    });
+
+    // PUT /client-gallery/:id/approve — admin approves/rejects
+    app.put('/client-gallery/:id/approve', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        const { status } = req.body; // 'approved' | 'rejected'
+        if (!['approved','rejected'].includes(status)) return res.status(400).json({ success:false, error:'status must be approved or rejected' });
+        await db.collection('CLIENT_GALLERY').updateOne({ _id:new ObjectId(req.params.id) }, { $set:{ status, reviewedAt:new Date() } });
+
+        // If approved, also add to main GALLERY for homepage display
+        if (status === 'approved') {
+          const post = await db.collection('CLIENT_GALLERY').findOne({ _id:new ObjectId(req.params.id) });
+          if (post) {
+            await db.collection('GALLERY').insertOne({
+              imageUrl:    post.afterImageUrl,
+              clientName:  post.clientName,
+              caption:     post.caption || post.serviceNames.join(', '),
+              source:      'client_upload',
+              refId:       post._id,
+              createdAt:   new Date(),
+            });
+          }
+        }
+        res.json({ success:true });
+      } catch (err) { next(err); }
+    });
+
+    // POST /client-gallery/:id/like — like a photo
+    app.post('/client-gallery/:id/like', authenticateToken, async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        await db.collection('CLIENT_GALLERY').updateOne({ _id:new ObjectId(req.params.id) }, { $inc:{ likes:1 } });
+        res.json({ success:true });
+      } catch (err) { next(err); }
+    });
+
+    // DELETE /client-gallery/:id — owner or admin can delete
+    app.delete('/client-gallery/:id', authenticateToken, async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        const post = await db.collection('CLIENT_GALLERY').findOne({ _id:new ObjectId(req.params.id) });
+        if (!post) return res.status(404).json({ success:false, error:'Post not found' });
+        if (req.user.role !== 'admin' && String(post.userId) !== String(req.user.userId))
+          return res.status(403).json({ success:false, error:'Not authorized' });
+        await db.collection('CLIENT_GALLERY').deleteOne({ _id:new ObjectId(req.params.id) });
+        res.json({ success:true });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // INVENTORY MANAGEMENT
+    // ══════════════════════════════════════════════════════════════════════
+
+    // GET /inventory — stock levels + restock alerts
+    app.get('/inventory', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const products = await db.collection('PRODUCTS')
+          .find({ isActive: true })
+          .project({ name:1, stock:1, sku:1, brand:1, category:1, images:1, price:1 })
+          .toArray();
+
+        const LOW_THRESHOLD  = 5;
+        const ZERO_THRESHOLD = 0;
+
+        const withStatus = products.map(p => ({
+          ...p,
+          price: parseFloat(p.price?.toString() || 0),
+          stockStatus: p.stock === 0 ? 'out' : p.stock <= LOW_THRESHOLD ? 'low' : 'ok',
+        }));
+
+        const stats = {
+          total:    products.length,
+          ok:       withStatus.filter(p => p.stockStatus === 'ok').length,
+          low:      withStatus.filter(p => p.stockStatus === 'low').length,
+          out:      withStatus.filter(p => p.stockStatus === 'out').length,
+          totalValue: withStatus.reduce((sum, p) => sum + p.stock * p.price, 0),
+        };
+
+        res.json({ success:true, data: { products: withStatus, stats } });
+      } catch (err) { next(err); }
+    });
+
+    // POST /inventory/restock — record a stock purchase
+    app.post('/inventory/restock',
+      authenticateToken, authorizeRole('admin'),
+      body('productId').isMongoId(),
+      body('quantity').isInt({ min:1 }),
+      body('costPerUnit').isFloat({ min:0 }),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+
+          const { productId, quantity, costPerUnit, supplier, notes, invoiceRef } = req.body;
+          const prodId = new ObjectId(productId);
+
+          const product = await db.collection('PRODUCTS').findOne({ _id: prodId });
+          if (!product) return res.status(404).json({ success:false, error:'Product not found' });
+
+          const prevStock = product.stock || 0;
+          const newStock  = prevStock + parseInt(quantity);
+
+          // Update product stock
+          await db.collection('PRODUCTS').updateOne(
+            { _id: prodId },
+            { $inc: { stock: parseInt(quantity) }, $set: { updatedAt: new Date() } }
+          );
+
+          // Record restock order
+          const order = {
+            productId:   prodId,
+            productName: product.name,
+            type:        'restock',
+            quantity:    parseInt(quantity),
+            costPerUnit: parseFloat(costPerUnit),
+            totalCost:   parseInt(quantity) * parseFloat(costPerUnit),
+            prevStock,
+            newStock,
+            supplier:    supplier || null,
+            notes:       sanitiseText(notes || '', 300),
+            invoiceRef:  invoiceRef || null,
+            recordedBy:  new ObjectId(req.user.userId),
+            createdAt:   new Date(),
+          };
+
+          await db.collection('INVENTORY_ORDERS').insertOne(order);
+          logger.info(`[INVENTORY] Restocked ${product.name}: +${quantity} units`);
+
+          res.status(201).json({ success:true, data: { ...order, newStock } });
+        } catch (err) { next(err); }
+      }
+    );
+
+    // GET /inventory/history?productId=xxx — restock history for a product
+    app.get('/inventory/history', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const filter = {};
+        if (req.query.productId?.match(/^[a-f\d]{24}$/i)) filter.productId = new ObjectId(req.query.productId);
+        const page  = Math.max(1, parseInt(req.query.page || '1'));
+        const limit = Math.min(100, parseInt(req.query.limit || '50'));
+
+        const [orders, total] = await Promise.all([
+          db.collection('INVENTORY_ORDERS').find(filter).sort({ createdAt:-1 }).skip((page-1)*limit).limit(limit).toArray(),
+          db.collection('INVENTORY_ORDERS').countDocuments(filter),
+        ]);
+        res.json({ success:true, data: orders, total, page, pages: Math.ceil(total/limit) });
+      } catch (err) { next(err); }
+    });
+
+    // CRUD: Suppliers
+    app.get('/suppliers',    authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try { const s = await db.collection('SUPPLIERS').find({}).sort({ name:1 }).toArray(); res.json({ success:true, data:s }); } catch (e) { next(e); }
+    });
+    app.post('/suppliers', authenticateToken, authorizeRole('admin'),
+      body('name').isString().notEmpty(),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+          const { name, email, phone, address, notes } = req.body;
+          const result = await db.collection('SUPPLIERS').insertOne({ name: sanitiseText(name,100), email: email||null, phone: phone||null, address: sanitiseText(address||'',200), notes: sanitiseText(notes||'',300), isActive:true, createdAt:new Date(), updatedAt:new Date() });
+          res.status(201).json({ success:true, data:{ _id:result.insertedId } });
+        } catch (err) { next(err); }
+      }
+    );
+    app.delete('/suppliers/:id', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        await db.collection('SUPPLIERS').deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success:true });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SMS NOTIFICATIONS
+    // Uses Africa's Talking API if AT_API_KEY + AT_USERNAME are set.
+    // Falls back to logging a wa.me link so admin can send manually.
+    // ══════════════════════════════════════════════════════════════════════
+
+    async function sendSMS(phone, message) {
+      const cleaned = phone.replace(/\D/g, '');
+      // Normalise to E.164 South African format
+      const e164 = cleaned.startsWith('27') ? `+${cleaned}`
+        : cleaned.startsWith('0') ? `+27${cleaned.slice(1)}`
+        : `+${cleaned}`;
+
+      if (process.env.AT_API_KEY && process.env.AT_USERNAME) {
+        try {
+          const params = new URLSearchParams({
+            username: process.env.AT_USERNAME,
+            to:       e164,
+            message,
+            from:     process.env.AT_SENDER_ID || 'NXLBeauty',
+          });
+          const resp = await fetchFn('https://api.africastalking.com/version1/messaging', {
+            method:  'POST',
+            headers: {
+              'apiKey':       process.env.AT_API_KEY,
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Accept':       'application/json',
+            },
+            body: params.toString(),
+          });
+          const data = await resp.json();
+          const status = data?.SMSMessageData?.Recipients?.[0]?.status;
+          logger.info(`[SMS] Sent to ${e164}: ${status}`);
+          return { sent: true, status, provider: 'africastalking' };
+        } catch (smsErr) {
+          logger.error(`[SMS] Africa's Talking failed: ${smsErr.message}`);
+        }
+      }
+
+      // Fallback — log WhatsApp link
+      const waText = encodeURIComponent(message);
+      const waUrl  = `https://wa.me/${e164.replace('+','')}?text=${waText}`;
+      logger.info(`[SMS FALLBACK] No AT credentials — wa.me link: ${waUrl}`);
+      return { sent: false, waUrl, provider: 'fallback' };
+    }
+
+    // POST /sms/send — admin manually sends SMS to a client
+    app.post('/sms/send', authenticateToken, authorizeRole('admin'),
+      body('phone').isString().notEmpty(),
+      body('message').isString().notEmpty().isLength({ max: 160 }),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+          const result = await sendSMS(req.body.phone, req.body.message);
+          res.json({ success: true, data: result });
+        } catch (err) { next(err); }
+      }
+    );
+
+    // POST /sms/bulk — send SMS to multiple clients (e.g. promo blast)
+    app.post('/sms/bulk', authenticateToken, authorizeRole('admin'),
+      body('phones').isArray({ min:1, max:50 }),
+      body('message').isString().notEmpty().isLength({ max: 160 }),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+          const results = await Promise.allSettled(
+            req.body.phones.map(phone => sendSMS(phone, req.body.message))
+          );
+          const sent   = results.filter(r => r.status === 'fulfilled' && r.value?.sent).length;
+          const failed = results.length - sent;
+          res.json({ success: true, data: { sent, failed, total: results.length } });
+        } catch (err) { next(err); }
+      }
+    );
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════════════
+    // STAFF SCHEDULE ROUTES
+    // ══════════════════════════════════════════════════════════════════════
+
+    // GET /employees/:id/schedule?start=YYYY-MM-DD&end=YYYY-MM-DD
+    // Returns appointments + blocked slots for a staff member in a date range
+    app.get('/employees/:id/schedule', authenticateToken, async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i))
+          return res.status(400).json({ success:false, error:'Invalid employee ID' });
+
+        const { start, end } = req.query;
+        if (!start || !end) return res.status(400).json({ success:false, error:'start and end dates required' });
+
+        const empId = new ObjectId(req.params.id);
+        const employee = await db.collection('EMPLOYEES').findOne({ _id: empId });
+        if (!employee) return res.status(404).json({ success:false, error:'Employee not found' });
+
+        const [appointments, blockedSlots] = await Promise.all([
+          db.collection('APPOINTMENTS').find({
+            employeeId: empId,
+            date: { $gte: start, $lte: end },
+            status: { $nin: ['cancelled'] },
+          }).toArray(),
+          db.collection('AVAILABILITY').find({
+            employeeId: { $in: [req.params.id, 'ALL'] },
+            date: { $gte: start, $lte: end },
+          }).toArray(),
+        ]);
+
+        // Enrich appointments with client + service names
+        const userIds  = [...new Set(appointments.map(a => a.userId))];
+        const svcIds   = [...new Set(appointments.flatMap(a => a.serviceIds || []))];
+        const [users, services] = await Promise.all([
+          db.collection('USERS').find({ _id: { $in: userIds } }).project({ firstName:1, lastName:1, phone:1 }).toArray(),
+          db.collection('SERVICES').find({ _id: { $in: svcIds } }).project({ name:1, durationMinutes:1 }).toArray(),
+        ]);
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+        const svcMap  = Object.fromEntries(services.map(s => [s._id.toString(), s]));
+
+        const enriched = appointments.map(a => ({
+          ...a,
+          clientName: userMap[a.userId?.toString()] ? `${userMap[a.userId.toString()].firstName} ${userMap[a.userId.toString()].lastName}` : a.userName || '—',
+          clientPhone: userMap[a.userId?.toString()]?.phone || '',
+          serviceNames: (a.serviceIds || []).map(id => svcMap[id?.toString()]?.name).filter(Boolean),
+          durationMinutes: (a.serviceIds || []).reduce((sum, id) => sum + (svcMap[id?.toString()]?.durationMinutes || 30), 0),
+        }));
+
+        res.json({ success:true, data: { employee, appointments: enriched, blockedSlots } });
+      } catch (err) { next(err); }
+    });
+
+    // PUT /employees/:id/working-hours — set weekly working hours
+    app.put('/employees/:id/working-hours', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i))
+          return res.status(400).json({ success:false, error:'Invalid employee ID' });
+
+        const { workingHours } = req.body;
+        // workingHours = { mon:{start:'09:00',end:'17:00',active:true}, tue:{...}, ... }
+        if (!workingHours) return res.status(400).json({ success:false, error:'workingHours required' });
+
+        await db.collection('EMPLOYEES').updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { workingHours, updatedAt: new Date() } }
+        );
+        const updated = await db.collection('EMPLOYEES').findOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success:true, data: updated });
+      } catch (err) { next(err); }
+    });
+
+    // GET /staff/overview?date=YYYY-MM-DD — all staff schedule for a single day
+    app.get('/staff/overview', authenticateToken, async (req, res, next) => {
+      try {
+        const date = req.query.date || new Date().toISOString().slice(0,10);
+        const [allStaff, appointments, blocked] = await Promise.all([
+          db.collection('EMPLOYEES').find({ isActive: true }).toArray(),
+          db.collection('APPOINTMENTS').find({ date, status: { $nin: ['cancelled'] } }).toArray(),
+          db.collection('AVAILABILITY').find({ date }).toArray(),
+        ]);
+
+        const svcIds  = [...new Set(appointments.flatMap(a => a.serviceIds || []))];
+        const userIds = [...new Set(appointments.map(a => a.userId))];
+        const [services, users] = await Promise.all([
+          db.collection('SERVICES').find({ _id: { $in: svcIds } }).project({ name:1, durationMinutes:1 }).toArray(),
+          db.collection('USERS').find({ _id: { $in: userIds } }).project({ firstName:1, lastName:1 }).toArray(),
+        ]);
+        const svcMap  = Object.fromEntries(services.map(s => [s._id.toString(), s]));
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
+
+        const staffSchedule = allStaff.map(emp => ({
+          ...emp,
+          appointments: appointments
+            .filter(a => String(a.employeeId) === String(emp._id))
+            .map(a => ({
+              ...a,
+              clientName:   userMap[a.userId?.toString()] ? `${userMap[a.userId.toString()].firstName} ${userMap[a.userId.toString()].lastName}` : a.userName || '—',
+              serviceNames: (a.serviceIds || []).map(id => svcMap[id?.toString()]?.name).filter(Boolean),
+              durationMinutes: (a.serviceIds || []).reduce((sum, id) => sum + (svcMap[id?.toString()]?.durationMinutes || 30), 0),
+            })),
+          blockedSlots: blocked.filter(b => String(b.employeeId) === String(emp._id) || b.employeeId === 'ALL').map(b => b.time),
+        }));
+
+        res.json({ success:true, data: { date, staff: staffSchedule } });
+      } catch (err) { next(err); }
+    });
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── POST /discount-codes/validate
+
+    // ── GET /services/public ───────────────────────────────────────────────
+    app.get('/services/public', async (req, res, next) => {
+      try {
+        const svcs = await db.collection('SERVICES').find({ isActive: true }).toArray();
+        res.json({ success: true, data: svcs.map(s => ({ ...s, price: parseFloat(s.price?.toString() || 0) })) });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /employees/public ──────────────────────────────────────────────
+    app.get('/employees/public', async (req, res, next) => {
+      try {
+        const staff = await db.collection('EMPLOYEES').find({ isActive: true }).project({ name:1, role:1, bio:1 }).toArray();
+        res.json({ success: true, data: staff });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /availability/slots ────────────────────────────────────────────
+    app.get('/availability/slots', async (req, res, next) => {
+      try {
+        const { date, employeeId } = req.query;
+        if (!date || !employeeId) return res.status(400).json({ success: false, error: 'date and employeeId are required' });
+        const empQuery = employeeId === 'any' ? {} : { employeeId: new ObjectId(employeeId) };
+        const blocked  = await db.collection('AVAILABILITY').find({ date, ...empQuery }).project({ time:1 }).toArray();
+        const booked   = await db.collection('APPOINTMENTS').find({
+          date, ...empQuery, status: { $in: ['booked', 'pending'] },
+        }).project({ time:1 }).toArray();
+        const taken = [...new Set([...blocked.map(b => b.time), ...booked.map(b => b.time)])];
+        res.json({ success: true, data: taken });
+      } catch (err) { next(err); }
+    });
+
+    // ── POST /appointments/guest — book without login ──────────────────────
+    app.post('/appointments/guest',
+      body('serviceIds').isArray({ min: 1 }),
+      body('date').matches(/^\d{4}-\d{2}-\d{2}$/),
+      body('time').matches(/^\d{2}:\d{2}$/),
+      body('firstName').isString().notEmpty().trim(),
+      body('lastName').isString().notEmpty().trim(),
+      body('email').isEmail().normalizeEmail(),
+      body('phone').isString().notEmpty(),
+      async (req, res, next) => {
+        const errs = validationResult(req);
+        if (!errs.isEmpty()) return sendValidationError(res, errs.array());
+        try {
+          const { serviceIds, employeeId, date, time, firstName, lastName, email, phone, notes } = req.body;
+
+          // Resolve userId — logged in or guest
+          let userId;
+          if (req.headers.authorization) {
+            try { const tok = req.headers.authorization.split(' ')[1]; const dec = jwt.verify(tok, process.env.JWT_SECRET); userId = new ObjectId(dec.userId); } catch {}
+          }
+          if (!userId) {
+            let existing = await db.collection('USERS').findOne({ email: email.toLowerCase() });
+            if (!existing) {
+              const bcrypt = require('bcryptjs');
+              const r2 = await db.collection('USERS').insertOne({ email: email.toLowerCase(), password: await bcrypt.hash(Math.random().toString(36), 10), firstName: sanitiseText(firstName, 50), lastName: sanitiseText(lastName, 50), phone: sanitiseText(phone, 20), role: 'user', isActive: true, isGuest: true, createdAt: new Date(), updatedAt: new Date() });
+              userId = r2.insertedId;
+              try { await awardPoints(userId, LOYALTY_CONFIG.signupBonus, 'Welcome bonus — guest booking'); } catch {}
+            } else { userId = existing._id; }
+          }
+
+          const svcIds = serviceIds.map(id => new ObjectId(id));
+          const svcs   = await db.collection('SERVICES').find({ _id: { $in: svcIds }, isActive: true }).toArray();
+          if (svcs.length !== svcIds.length) return res.status(400).json({ success: false, error: 'One or more services not found.' });
+
+          let empId;
+          if (!employeeId || employeeId === 'any') {
+            const avail = await db.collection('EMPLOYEES').findOne({ isActive: true });
+            empId = avail?._id;
+          } else { empId = new ObjectId(employeeId); }
+          if (!empId) return res.status(400).json({ success: false, error: 'No staff available.' });
+
+          const totalPrice    = svcs.reduce((s, sv) => s + parseFloat(sv.price?.toString() || 0), 0);
+          const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
+          const result = await db.collection('APPOINTMENTS').insertOne({
+            userId, employeeId: empId, serviceIds: svcIds, date, time,
+            status: 'pending', paymentStatus: 'unpaid',
+            notes: sanitiseText(notes || '', 500),
+            totalPrice: Decimal128.fromString(totalPrice.toFixed(2)),
+            depositAmount: Decimal128.fromString(depositAmount.toFixed(2)),
+            userName: `${sanitiseText(firstName, 50)} ${sanitiseText(lastName, 50)}`,
+            createdAt: new Date(), updatedAt: new Date(),
+          });
+
+          if (process.env.RESEND_API_KEY) {
+            try {
+              const resend = new Resend(process.env.RESEND_API_KEY);
+              await resend.emails.send({ from:'NXL Beauty Bar <onboarding@resend.dev>', to: email, subject:`Booking Request — NXL Beauty Bar`, html:`<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;"><h2 style="color:#3d1f15;font-family:Georgia,serif;">NXL Beauty Bar</h2><h3 style="color:#6b3528;">Booking Received! 📅</h3><p>Hi ${sanitiseText(firstName, 50)},</p><p>Your booking request for <strong>${date}</strong> at <strong>${time}</strong> has been received.</p><p>Services: <strong>${svcs.map(s => s.name).join(', ')}</strong></p><p style="color:#9e7060;font-size:0.82rem;">We'll confirm shortly. A deposit of R${depositAmount} is required.</p></div>` });
+            } catch (em) { logger.error(`[GUEST BOOKING EMAIL] ${em.message}`); }
+          }
+          await db.collection('NOTIFICATIONS').insertOne({ message: `New booking from ${firstName} ${lastName} — ${date} at ${time}`, target: 'staff', read: false, createdAt: new Date() });
+          res.status(201).json({ success: true, data: { _id: result.insertedId, date, time } });
+        } catch (err) {
+          if (err.code === 11000) return res.status(409).json({ success: false, error: 'That time slot is no longer available.' });
+          next(err);
+        }
+      }
+    );
+    // ──────────────────────────────────────────────────────────────────────
     app.post('/discount-codes/validate', authenticateToken, discountLimiter, async (req, res, next) => {
       try {
         const { code, subtotal } = req.body;
@@ -2079,6 +4076,37 @@ ${urlEntries}
 
             logger.info(`[REMINDER] Sent to ${clientUser.email} for appointment ${appt._id}`);
 
+            // ── SMS reminder ──────────────────────────────────────────────
+            if (clientUser.phone) {
+              try {
+                await sendSMS(clientUser.phone,
+                  `NXL Beauty Bar reminder: You have an appointment tomorrow ${tomorrowISO} at ${appt.time}. 📍 1948 Mahalefele Rd, Dube, Soweto. Reply STOP to unsubscribe.`
+                );
+              } catch (smsErr) { logger.error(`[SMS REMINDER] ${smsErr.message}`); }
+            }
+            // ─────────────────────────────────────────────────────────────
+
+            // ── WhatsApp reminder (via wa.me deep link stored as notification) ──
+            // If the user has a phone number, log a WhatsApp-ready notification
+            // so admin can see & tap to send. Full automation requires Meta Business API.
+            if (clientUser.phone) {
+              const waText = encodeURIComponent(
+                `Hi ${clientUser.firstName}! 👋 This is a reminder from NXL Beauty Bar. You have an appointment tomorrow, ${tomorrowISO} at ${appt.time}. ` +
+                `📍 1948 Mahalefele Rd, Dube, Soweto. Please arrive 5 mins early. See you soon! 💅`
+              );
+              const waUrl = `https://wa.me/${clientUser.phone.replace(/\D/g, '')}?text=${waText}`;
+              await db.collection('NOTIFICATIONS').insertOne({
+                type:    'whatsapp_reminder',
+                message: `WhatsApp reminder ready for ${clientUser.firstName} ${clientUser.lastName} (${appt.date} ${appt.time})`,
+                waUrl,
+                phone:   clientUser.phone,
+                read:    false,
+                target:  'staff',
+                createdAt: new Date(),
+              });
+            }
+            // ──────────────────────────────────────────────────────────────────
+
           } catch (apptErr) {
             logger.error(`[REMINDER] Failed for appointment ${appt._id}: ${apptErr.message}`);
           }
@@ -2088,6 +4116,59 @@ ${urlEntries}
       }
     }
 
+    // ── Subscription renewal cron — runs daily ─────────────────────────────
+    async function processSubscriptionRenewals() {
+      try {
+        const now = new Date();
+        const due = await db.collection('SUBSCRIPTIONS').find({
+          status:      'active',
+          autoRenew:   true,
+          renewalDate: { $lte: now },
+        }).toArray();
+
+        for (const sub of due) {
+          try {
+            const planPrice = parseFloat(sub.planPrice?.toString() || 0);
+            // Reset booking credits and set next renewal
+            const nextRenewal = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+            await db.collection('SUBSCRIPTIONS').updateOne(
+              { _id: sub._id },
+              {
+                $set:  { bookingsRemaining: sub.bookingsPerMonth, renewalDate: nextRenewal, updatedAt: now },
+                $push: { payments: { amount: planPrice, date: now, type: 'renewal' } },
+              }
+            );
+
+            // Notify client
+            await notifyClient(sub.userId, {
+              type:  'order_confirmed',
+              title: `${sub.planName} Renewed 🔄`,
+              body:  `Your subscription has renewed. You have ${sub.bookingsPerMonth} fresh bookings this month!`,
+              link:  '/profile',
+            });
+
+            // Award loyalty points for renewal
+            try { await awardPoints(sub.userId, 50, `Subscription renewal — ${sub.planName}`); } catch {}
+
+            logger.info(`[SUB RENEWAL] Renewed subscription ${sub._id} for user ${sub.userId}`);
+          } catch (subErr) {
+            logger.error(`[SUB RENEWAL] Failed for sub ${sub._id}: ${subErr.message}`);
+          }
+        }
+
+        if (due.length > 0) logger.info(`[SUB RENEWAL] Processed ${due.length} subscription renewal(s)`);
+      } catch (err) {
+        logger.error(`[SUB RENEWAL] Cron error: ${err.message}`);
+      }
+    }
+
+    // Run once on startup and daily
+    processSubscriptionRenewals();
+    setInterval(processSubscriptionRenewals, 24 * 60 * 60 * 1000);
+    logger.info('[SUB RENEWAL] Subscription renewal cron scheduled (daily)');
+    // ──────────────────────────────────────────────────────────────────────
+
+    // ── Subscription renewal cron END
     // Run once on startup then every hour
     sendAppointmentReminders();
     setInterval(sendAppointmentReminders, 60 * 60 * 1000);
@@ -2110,3 +4191,9 @@ ${urlEntries}
 }
 
 startServer();
+
+// ═══════════════════════════════════════════════════════════════════════
+// SMS HELPER — uses Africa's Talking or falls back to WhatsApp link log
+// Set env vars: AT_API_KEY, AT_USERNAME (Africa's Talking sandbox/prod)
+// Without them, SMS notifications are logged and a wa.me link is created
+// ═══════════════════════════════════════════════════════════════════════
