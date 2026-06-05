@@ -2437,50 +2437,72 @@ async function startServer() {
     app.get('/robots.txt', (req, res) => {
       const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
       res.type('text/plain').send(
-`User-agent: *
+`# NXL Beauty Bar — robots.txt
+# Generated dynamically by nxlbeautybar.co.za
+
+User-agent: *
 Allow: /
+
+# Private pages
 Disallow: /admin-dashboard
 Disallow: /dashboard
 Disallow: /profile
 Disallow: /cart
 Disallow: /checkout
-Disallow: /shop/order-success
 Disallow: /orders
-Disallow: /reset-password
 Disallow: /payment
+Disallow: /payment-cancel
+Disallow: /reset-password
+Disallow: /shop/order-success
 
-Sitemap: ${frontendUrl}/sitemap.xml`
+# Allow bots to crawl public pages
+Allow: /shop
+Allow: /shop/product/
+Allow: /gallery
+Allow: /book
+Allow: /subscriptions
+Allow: /login
+Allow: /signup
+
+# Crawl delay for polite bots
+Crawl-delay: 1
+
+Sitemap: ${frontendUrl}/sitemap.xml
+Sitemap: ${frontendUrl}/sitemap-images.xml`
       );
     });
 
-    // ── sitemap.xml — dynamic, includes all products and services ─────────
+    // ── sitemap.xml — dynamic, all public pages ───────────────────────────
     app.get('/sitemap.xml', async (req, res) => {
       try {
         const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
         const now = new Date().toISOString().slice(0, 10);
 
-        // Fetch all active products and services
-        const [products, services] = await Promise.all([
-          db.collection('PRODUCTS').find({ isActive: true }, { projection: { _id:1, name:1, updatedAt:1, category:1 } }).toArray(),
-          db.collection('SERVICES').find({ isActive: true }, { projection: { _id:1, name:1, updatedAt:1 } }).toArray(),
+        const [products, services, galleryPosts] = await Promise.all([
+          db.collection('PRODUCTS').find({ isActive:true }, { projection:{ _id:1, name:1, updatedAt:1, category:1 } }).toArray(),
+          db.collection('SERVICES').find({ isActive:true }, { projection:{ _id:1, name:1, updatedAt:1, category:1 } }).toArray(),
+          db.collection('CLIENT_GALLERY').find({ status:'approved' }, { projection:{ _id:1, createdAt:1 } }).limit(100).toArray(),
         ]);
 
         const staticPages = [
-          { url: '/',       priority: '1.0', freq: 'weekly'  },
-          { url: '/shop',   priority: '0.9', freq: 'daily'   },
-          { url: '/login',  priority: '0.5', freq: 'monthly' },
-          { url: '/signup', priority: '0.5', freq: 'monthly' },
+          { url:'/',             priority:'1.0', freq:'weekly'  },
+          { url:'/shop',         priority:'0.9', freq:'daily'   },
+          { url:'/book',         priority:'0.9', freq:'weekly'  },
+          { url:'/gallery',      priority:'0.7', freq:'weekly'  },
+          { url:'/subscriptions',priority:'0.8', freq:'monthly' },
+          { url:'/login',        priority:'0.5', freq:'monthly' },
+          { url:'/signup',       priority:'0.5', freq:'monthly' },
         ];
 
         const productPages = products.map(p => ({
-          url:      `/shop/product/${p._id}`,
-          priority: '0.8',
-          freq:     'weekly',
-          lastmod:  p.updatedAt ? new Date(p.updatedAt).toISOString().slice(0,10) : now,
+          url:     `/shop/product/${p._id}`,
+          priority:'0.8',
+          freq:    'weekly',
+          lastmod: p.updatedAt ? new Date(p.updatedAt).toISOString().slice(0,10) : now,
         }));
 
         const allPages = [
-          ...staticPages.map(p => ({ ...p, lastmod: now })),
+          ...staticPages.map(p => ({ ...p, lastmod:now })),
           ...productPages,
         ];
 
@@ -2505,6 +2527,54 @@ ${urlEntries}
       } catch (err) {
         logger.error(`[SITEMAP] Error: ${err.message}`);
         res.status(500).send('Error generating sitemap');
+      }
+    });
+
+    // ── sitemap-images.xml — all product + gallery images ─────────────────
+    app.get('/sitemap-images.xml', async (req, res) => {
+      try {
+        const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
+        const [products, galleryPosts] = await Promise.all([
+          db.collection('PRODUCTS').find({ isActive:true }, { projection:{ _id:1, name:1, images:1 } }).toArray(),
+          db.collection('CLIENT_GALLERY').find({ status:'approved' }, { projection:{ _id:1, afterImageUrl:1, caption:1 } }).limit(100).toArray(),
+        ]);
+
+        const entries = [
+          ...products.flatMap(p => (p.images||[]).slice(0,3).map(img => ({
+            pageUrl: `${frontendUrl}/shop/product/${p._id}`,
+            imageUrl: img,
+            title:    p.name,
+            caption:  `${p.name} — NXL Beauty Bar`,
+          }))),
+          ...galleryPosts.map(g => ({
+            pageUrl:  `${frontendUrl}/gallery`,
+            imageUrl: g.afterImageUrl,
+            title:    g.caption || 'Before & After — NXL Beauty Bar',
+            caption:  g.caption || 'Client transformation at NXL Beauty Bar, Soweto',
+          })),
+        ].filter(e => e.imageUrl?.startsWith('http'));
+
+        const urlEntries = entries.map(e => `
+  <url>
+    <loc>${e.pageUrl}</loc>
+    <image:image>
+      <image:loc>${e.imageUrl}</image:loc>
+      <image:title>${e.title.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c]))}</image:title>
+      <image:caption>${e.caption.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c]))}</image:caption>
+    </image:image>
+  </url>`).join('');
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+${urlEntries}
+</urlset>`;
+
+        res.type('application/xml').send(xml);
+        logger.info(`[SITEMAP-IMAGES] Served ${entries.length} image URLs`);
+      } catch (err) {
+        logger.error(`[SITEMAP-IMAGES] Error: ${err.message}`);
+        res.status(500).send('Error generating image sitemap');
       }
     });
     // ──────────────────────────────────────────────────────────────────────
