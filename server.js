@@ -272,6 +272,13 @@ const initCollections = async (db) => {
   await db.createCollection('SUBSCRIPTION_PLANS', {}).catch(() => {});
   await db.collection('SUBSCRIPTION_PLANS').createIndex({ isActive: 1 });
 
+  // FEEDBACK — post-visit NPS surveys
+  await db.createCollection('FEEDBACK', {}).catch(() => {});
+  await db.collection('FEEDBACK').createIndex({ userId: 1 });
+  await db.collection('FEEDBACK').createIndex({ appointmentId: 1 }, { unique: true, sparse: true });
+  await db.collection('FEEDBACK').createIndex({ createdAt: -1 });
+  await db.collection('FEEDBACK').createIndex({ npsScore: 1 });
+
   // SUBSCRIPTIONS — client subscriptions
   await db.createCollection('SUBSCRIPTIONS', {}).catch(() => {});
   await db.collection('SUBSCRIPTIONS').createIndex({ userId: 1 });
@@ -430,12 +437,6 @@ async function startServer() {
           }
           // ─────────────────────────────────────────────────────────────────
 
-          // ── Signup loyalty bonus ───────────────────────────────────────────
-          try {
-            await awardPoints(result.insertedId, LOYALTY_CONFIG.signupBonus, 'Welcome bonus — new member');
-          } catch (loyaltyErr) { logger.error(`[LOYALTY] Signup bonus failed: ${loyaltyErr.message}`); }
-          // ─────────────────────────────────────────────────────────────────
-
           // ── Referral program — handle referral code on signup ─────────────
           const { referralCode: refCode } = req.body;
           if (refCode) {
@@ -463,17 +464,12 @@ async function startServer() {
                   { $set: { referredBy: referrer._id, referredByCode: refCode.trim().toUpperCase() } }
                 );
 
-                // Give referrer signup bonus points
-                await awardPoints(referrer._id, REFERRAL_CONFIG.signupBonus,
-                  `Referral signup bonus — ${firstName} joined`);
-
-                // Notify referrer
+                // Notify referrer — friend signed up (points come when they book)
                 await notifyClient(referrer._id, {
-                  type:  'loyalty_earned',
+                  type:  'promotion',
                   title: `${firstName} joined using your referral! 🎉`,
-                  body:  `You earned +${REFERRAL_CONFIG.signupBonus} points. You'll earn +${REFERRAL_CONFIG.referrerPoints} more when they complete their first booking.`,
+                  body:  `You'll earn +${REFERRAL_CONFIG.referrerPoints} points when they complete their first booking.`,
                   link:  '/profile',
-                  meta:  { points: REFERRAL_CONFIG.signupBonus },
                 });
 
                 // Create a one-time discount code for the referee (R50 off first order)
@@ -1175,7 +1171,7 @@ async function startServer() {
     // =====================
     app.post('/payments', authenticateToken, paymentLimiter, async (req, res, next) => {
       try {
-        const { appointmentId } = req.body;
+        const { appointmentId, loyaltyPointsToRedeem, discountCode } = req.body;
         if (!appointmentId) return res.status(400).json({ success:false, error:'appointmentId is required' });
         let apptId;
         try { apptId = new ObjectId(appointmentId); } catch { return res.status(400).json({ success:false, error:'Invalid appointmentId' }); }
@@ -1186,8 +1182,22 @@ async function startServer() {
         const frontendUrl = process.env.FRONTEND_URL || 'https://nxlbeautybar.co.za';
         const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
         const amountInCents = Math.round(depositAmount * 100);
-        logger.info('Yoco: creating checkout session', { appointmentId, amountInCents });
-        const apptSnapshot = { appointmentId, date:appt.date, time:appt.time, userId:String(appt.userId), employeeId:String(appt.employeeId), serviceIds:(appt.serviceIds||[]).map(String), totalPrice:String(appt.totalPrice), userName:appt.userName||'' };
+        logger.info('Yoco: creating checkout session', { appointmentId, amountInCents, loyaltyPointsToRedeem, discountCode });
+        
+        // Build metadata with loyalty and discount info
+        const apptSnapshot = { 
+          appointmentId, 
+          date:appt.date, 
+          time:appt.time, 
+          userId:String(appt.userId), 
+          employeeId:String(appt.employeeId), 
+          serviceIds:(appt.serviceIds||[]).map(String), 
+          totalPrice:String(appt.totalPrice), 
+          userName:appt.userName||'',
+          loyaltyPointsToRedeem: loyaltyPointsToRedeem ? parseInt(loyaltyPointsToRedeem) : null,
+          discountCode: discountCode || null,
+        };
+        
         const yocoResponse = await fetchFn('https://payments.yoco.com/api/checkouts', {
           method:'POST',
           headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${process.env.YOCO_SECRET_KEY}` },
@@ -1203,7 +1213,7 @@ async function startServer() {
         try {
           await db.collection('PAYMENTS').updateOne(
             { appointmentId:apptId, type:'deposit' },
-            { $set:{ appointmentId:apptId, type:'deposit', amount:Decimal128.fromString(depositAmount.toFixed(2)), method:'online', status:'pending', yocoCheckoutId:yocoData.id, updatedAt:new Date(), apptSnapshot:{ date:appt.date, time:appt.time, userId:appt.userId, employeeId:appt.employeeId, serviceIds:appt.serviceIds, totalPrice:appt.totalPrice, userName:appt.userName||'' } }, $setOnInsert:{ createdAt:new Date() } },
+            { $set:{ appointmentId:apptId, type:'deposit', amount:Decimal128.fromString(depositAmount.toFixed(2)), method:'online', status:'pending', yocoCheckoutId:yocoData.id, updatedAt:new Date(), apptSnapshot:{ date:appt.date, time:appt.time, userId:appt.userId, employeeId:appt.employeeId, serviceIds:appt.serviceIds, totalPrice:appt.totalPrice, userName:appt.userName||'', loyaltyPointsToRedeem:loyaltyPointsToRedeem?parseInt(loyaltyPointsToRedeem):null, discountCode:discountCode||null } }, $setOnInsert:{ createdAt:new Date() } },
             { upsert:true }
           );
         } catch (payErr) { logger.error('Yoco: FAILED to save pending payment record', { appointmentId, error:payErr.message }); }
@@ -1211,9 +1221,49 @@ async function startServer() {
       } catch (err) { logger.error('Yoco payment init error:', err); next(err); }
     });
 
+    // ── GET /loyalty/booking-preview/:appointmentId — how many pts can be used ──
+    app.get('/loyalty/booking-preview/:id', authenticateToken, async (req, res, next) => {
+      try {
+        if (!req.params.id.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid ID' });
+        const userId  = new ObjectId(req.user.userId);
+        const appt    = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(req.params.id), userId });
+        if (!appt) return res.status(404).json({ success:false, error:'Appointment not found' });
+
+        const account       = await getLoyaltyAccount(userId);
+        const depositAmount = parseFloat(process.env.DEPOSIT_AMOUNT || 100);
+        const totalPrice    = parseFloat(appt.totalPrice?.toString() || 0);
+
+        // Balance = amount still owed at salon after deposit
+        const balance = Math.max(0, totalPrice - depositAmount);
+
+        // Max points usable = up to 50% of the balance (not the deposit)
+        const maxDiscount  = balance * (LOYALTY_CONFIG.maxRedemptionPct / 100);
+        const maxPtsUsable = Math.floor(maxDiscount / LOYALTY_CONFIG.pointValue);
+        const availablePts = Math.min(account.points, maxPtsUsable);
+        const discount     = parseFloat((availablePts * LOYALTY_CONFIG.pointValue).toFixed(2));
+        const newBalance   = Math.max(0, balance - discount);
+
+        res.json({
+          success: true,
+          data: {
+            currentPoints:   account.points,
+            maxPointsUsable: availablePts,
+            discountAmount:  discount,
+            depositAmount,          // always R100, never changes
+            totalPrice,
+            balance,                // what they owe at salon
+            newBalance,             // balance after points applied
+            pointValue:      LOYALTY_CONFIG.pointValue,
+            minRedemption:   LOYALTY_CONFIG.minRedemption,
+            canRedeem:       account.points >= LOYALTY_CONFIG.minRedemption && balance > 0,
+          },
+        });
+      } catch (err) { next(err); }
+    });
+    // ──────────────────────────────────────────────────────────────────────
     app.post('/payments/verify', authenticateToken, async (req, res, next) => {
       try {
-        const { appointmentId } = req.body;
+        const { appointmentId, loyaltyPointsToRedeem, discountCode } = req.body;
         if (!appointmentId) return res.status(400).json({ success:false, error:'appointmentId is required' });
         let apptId;
         try { apptId = new ObjectId(appointmentId); } catch { return res.status(400).json({ success:false, error:'Invalid appointmentId' }); }
@@ -1222,6 +1272,84 @@ async function startServer() {
         if (appt.status === 'booked' && appt.paymentStatus === 'deposit_paid') { return res.json({ success:true, alreadyConfirmed:true }); }
         await db.collection('APPOINTMENTS').updateOne({ _id:apptId }, { $set:{ status:'booked', paymentStatus:'deposit_paid', updatedAt:new Date() } });
         await db.collection('PAYMENTS').updateOne({ appointmentId:apptId, status:{ $ne:'paid' } }, { $set:{ status:'paid', paidAt:new Date(), updatedAt:new Date() } });
+
+        // ── Redeem loyalty points against balance (not deposit) ───────────
+        if (loyaltyPointsToRedeem && parseInt(loyaltyPointsToRedeem) >= LOYALTY_CONFIG.minRedemption) {
+          try {
+            const userId   = appt.userId;
+            console.log(`[LOYALTY REDEEM] Starting - userId: ${userId}, loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}`);
+            
+            const account  = await getLoyaltyAccount(userId);
+            console.log(`[LOYALTY REDEEM] Account fetched - currentPoints: ${account.points}`);
+            
+            const pts      = Math.min(parseInt(loyaltyPointsToRedeem), account.points);
+            console.log(`[LOYALTY REDEEM] Calculated pts to redeem: ${pts}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
+            
+            if (pts >= LOYALTY_CONFIG.minRedemption) {
+              const discount = parseFloat((pts * LOYALTY_CONFIG.pointValue).toFixed(2));
+              console.log(`[LOYALTY REDEEM] About to call redeemPoints with pts=${pts}, discount=${discount}`);
+              
+              await redeemPoints(userId, pts, `Redeemed against balance — ${pts} pts = R${discount} off at salon`, apptId);
+              console.log(`[LOYALTY REDEEM] redeemPoints completed successfully`);
+              
+              // Store on appointment so admin can see and deduct from balance due
+              await db.collection('APPOINTMENTS').updateOne(
+                { _id: apptId },
+                { $set: { loyaltyPointsRedeemed: pts, loyaltyBalanceDiscount: discount, updatedAt: new Date() } }
+              );
+              console.log(`[LOYALTY REDEEM] Appointment updated with redemption info`);
+              
+              await notifyClient(userId, {
+                type:  'loyalty_redeemed',
+                title: `${pts} Points Redeemed 🎁`,
+                body:  `R${discount} will be deducted from your balance due at the salon.`,
+                link:  '/dashboard',
+              });
+              console.log(`[LOYALTY REDEEM] Client notified`);
+            } else {
+              console.log(`[LOYALTY REDEEM] pts=${pts} is less than minRedemption=${LOYALTY_CONFIG.minRedemption}, skipping redemption`);
+            }
+          } catch (lErr) { 
+            console.error(`[LOYALTY REDEEM] ERROR: ${lErr.message}`);
+            console.error(`[LOYALTY REDEEM] Stack: ${lErr.stack}`);
+            logger.error(`[LOYALTY] Booking redemption failed: ${lErr.message}`); 
+          }
+        } else {
+          console.log(`[LOYALTY REDEEM] Condition not met - loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
+        }
+        // ──────────────────────────────────────────────────────────────────
+
+        // ── Apply discount code to booking balance ────────────────────────
+        if (discountCode) {
+          try {
+            const found = await db.collection('DISCOUNT_CODES').findOne({
+              code: discountCode.toUpperCase().trim(), isActive: true,
+              $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
+            });
+            if (found && !(found.usageLimit && found.usedCount >= found.usageLimit)) {
+              if (!found.forUserId || String(found.forUserId) === String(appt.userId)) {
+                const depositAmount = parseFloat(process.env.DEPOSIT_AMOUNT || 100);
+                const totalPrice    = parseFloat(appt.totalPrice?.toString() || 0);
+                const balance       = Math.max(0, totalPrice - depositAmount);
+                const discountAmt   = found.type === 'percentage'
+                  ? parseFloat((balance * found.value / 100).toFixed(2))
+                  : Math.min(found.value, balance);
+
+                await db.collection('APPOINTMENTS').updateOne(
+                  { _id: apptId },
+                  { $set: { discountCode: found.code, discountAmount: discountAmt, updatedAt: new Date() } }
+                );
+                await db.collection('DISCOUNT_CODES').updateOne(
+                  { _id: found._id },
+                  { $inc: { usedCount: 1 }, $set: { updatedAt: new Date() } }
+                );
+                logger.info(`[DISCOUNT] Code ${found.code} applied to booking ${apptId} — R${discountAmt} off`);
+              }
+            }
+          } catch (dcErr) { logger.error(`[DISCOUNT] Booking code apply failed: ${dcErr.message}`); }
+        }
+        // ──────────────────────────────────────────────────────────────────
+
         return res.json({ success:true });
       } catch (err) { next(err); }
     });
@@ -1231,6 +1359,7 @@ async function startServer() {
       setImmediate(async () => {
         try {
           const event = req.body;
+          console.log('[WEBHOOK DEBUG] Full event received:', JSON.stringify(event, null, 2));
           logger.info('Yoco webhook received', { type:event.type, payloadId:event.payload?.id });
           if (!event?.type) { logger.error('Yoco webhook: empty or malformed body'); return; }
           const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
@@ -1255,6 +1384,32 @@ async function startServer() {
           if (event.type === 'payment.succeeded') {
             const appointmentId = event.metadata?.appointmentId || event.payload?.metadata?.appointmentId;
             const checkoutId = event.payloadId || event.payload?.id;
+            let loyaltyPointsToRedeem = event.metadata?.loyaltyPointsToRedeem || event.payload?.metadata?.loyaltyPointsToRedeem;
+            let discountCode = event.metadata?.discountCode || event.payload?.metadata?.discountCode;
+            
+            console.log('[WEBHOOK DEBUG] Extracted from event:', { appointmentId, checkoutId, loyaltyPointsToRedeem, discountCode });
+            console.log('[WEBHOOK DEBUG] event.metadata:', event.metadata);
+            console.log('[WEBHOOK DEBUG] event.payload?.metadata:', event.payload?.metadata);
+            
+            // FIX: If metadata not in webhook, fetch from PAYMENTS collection
+            if (!loyaltyPointsToRedeem || !discountCode) {
+              try {
+                let apptIdObj;
+                try { apptIdObj = new ObjectId(appointmentId); } catch { apptIdObj = null; }
+                if (apptIdObj) {
+                  const paymentRecord = await db.collection('PAYMENTS').findOne({ appointmentId: apptIdObj });
+                  console.log('[WEBHOOK DEBUG] Fetched PAYMENTS record apptSnapshot:', paymentRecord?.apptSnapshot);
+                  if (paymentRecord?.apptSnapshot) {
+                    loyaltyPointsToRedeem = loyaltyPointsToRedeem || paymentRecord.apptSnapshot.loyaltyPointsToRedeem;
+                    discountCode = discountCode || paymentRecord.apptSnapshot.discountCode;
+                    console.log('[WEBHOOK DEBUG] Updated from PAYMENTS:', { loyaltyPointsToRedeem, discountCode });
+                  }
+                }
+              } catch (fetchErr) {
+                console.error('[WEBHOOK DEBUG] Error fetching PAYMENTS record:', fetchErr.message);
+              }
+            }
+            
             if (event.payload?.metadata?.type === 'shop_order') {
               const shopOrderId = event.payload?.metadata?.orderId;
               if (shopOrderId) {
@@ -1286,6 +1441,55 @@ async function startServer() {
                 } catch (recreateErr) { logger.error('Yoco webhook: failed to recreate appointment', { error:recreateErr.message }); }
               }
             }
+
+            // ── REDEEM LOYALTY POINTS ─────────────────────────────────────
+            if (loyaltyPointsToRedeem && parseInt(loyaltyPointsToRedeem) >= LOYALTY_CONFIG.minRedemption) {
+              try {
+                const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
+                if (appt) {
+                  const userId = appt.userId;
+                  console.log(`[WEBHOOK LOYALTY] Starting - userId: ${userId}, loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}`);
+                  
+                  const account = await getLoyaltyAccount(userId);
+                  console.log(`[WEBHOOK LOYALTY] Account fetched - currentPoints: ${account.points}`);
+                  
+                  const pts = Math.min(parseInt(loyaltyPointsToRedeem), account.points);
+                  console.log(`[WEBHOOK LOYALTY] Calculated pts to redeem: ${pts}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
+                  
+                  if (pts >= LOYALTY_CONFIG.minRedemption) {
+                    const discount = parseFloat((pts * LOYALTY_CONFIG.pointValue).toFixed(2));
+                    console.log(`[WEBHOOK LOYALTY] About to call redeemPoints with pts=${pts}, discount=${discount}`);
+                    
+                    await redeemPoints(userId, pts, `Redeemed against balance — ${pts} pts = R${discount} off at salon`, apptId);
+                    console.log(`[WEBHOOK LOYALTY] redeemPoints completed successfully`);
+                    
+                    // Store result on appointment
+                    await db.collection('APPOINTMENTS').updateOne(
+                      { _id: apptId },
+                      { $set: { loyaltyPointsRedeemed: pts, loyaltyBalanceDiscount: discount, updatedAt: new Date() } }
+                    );
+                    console.log(`[WEBHOOK LOYALTY] Appointment updated with redemption info`);
+                    
+                    await notifyClient(userId, {
+                      type:  'loyalty_redeemed',
+                      title: `${pts} Points Redeemed 🎁`,
+                      body:  `R${discount} will be deducted from your balance due at the salon.`,
+                      link:  '/dashboard',
+                    });
+                    console.log(`[WEBHOOK LOYALTY] Client notified`);
+                  } else {
+                    console.log(`[WEBHOOK LOYALTY] pts=${pts} is less than minRedemption=${LOYALTY_CONFIG.minRedemption}, skipping redemption`);
+                  }
+                }
+              } catch (loyaltyErr) {
+                console.error(`[WEBHOOK LOYALTY] ERROR: ${loyaltyErr.message}`);
+                console.error(`[WEBHOOK LOYALTY] Stack: ${loyaltyErr.stack}`);
+                logger.error(`[WEBHOOK LOYALTY] Webhook redemption failed: ${loyaltyErr.message}`);
+              }
+            } else {
+              console.log(`[WEBHOOK LOYALTY] Condition not met - loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
+            }
+            // ─────────────────────────────────────────────────────────────
           }
         } catch (err) {
           if (err.code === 11000) { logger.info('Yoco webhook: duplicate — already processed'); return; }
@@ -2078,10 +2282,7 @@ async function startServer() {
         // ── Award loyalty points for shop order ───────────────────────────
         try {
           const amountSpent = parseFloat(order.totalAmount?.toString() || 0);
-          const earnedPts   = Math.floor(amountSpent * LOYALTY_CONFIG.pointsPerRand);
-          if (earnedPts > 0) {
-            await awardPoints(order.userId, earnedPts, `Shop order #${orderId.slice(-6).toUpperCase()}`, new ObjectId(orderId));
-          }
+          // Points not awarded for shop orders — bookings only
           // Deduct redeemed points if any
           if (order.loyaltyPointsRedeemed > 0) {
             await redeemPoints(order.userId, order.loyaltyPointsRedeemed, `Redeemed at checkout — order #${orderId.slice(-6).toUpperCase()}`, new ObjectId(orderId));
@@ -2176,15 +2377,19 @@ async function startServer() {
         const totalDuration = services.reduce((sum, s) => sum + (s.durationMinutes || 30), 0);
 
         res.json({ success:true, data: {
-          name:             `${user.firstName} ${user.lastName}`.trim(),
-          email:            user.email,
-          appointmentDate:  appt.date,
-          appointmentTime:  appt.time,
-          selectedServices: services.map(s => s.name),
-          selectedEmployee: employee?.name || '',
-          totalPrice:       parseFloat(appt.totalPrice?.toString() || 0),
-          totalDuration:    totalDuration || 60,
-          paymentStatus:    appt.paymentStatus,
+          name:                 `${user.firstName} ${user.lastName}`.trim(),
+          email:                user.email,
+          appointmentDate:      appt.date,
+          appointmentTime:      appt.time,
+          selectedServices:     services.map(s => s.name),
+          selectedEmployee:     employee?.name || '',
+          totalPrice:           parseFloat(appt.totalPrice?.toString() || 0),
+          totalDuration:        totalDuration || 60,
+          paymentStatus:        appt.paymentStatus,
+          loyaltyPointsRedeemed:  appt.loyaltyPointsRedeemed || 0,
+          loyaltyBalanceDiscount: parseFloat(appt.loyaltyBalanceDiscount?.toString() || 0),
+          discountCode:           appt.discountCode || null,
+          discountAmount:         parseFloat(appt.discountAmount?.toString() || 0),
         }});
       } catch (err) { next(err); }
     });
@@ -2597,9 +2802,9 @@ ${urlEntries}
     // ══════════════════════════════════════════════════════════════════════
     // Config — edit these to change the program rules
     const LOYALTY_CONFIG = {
-      pointsPerRand:      1,      // 1 point per R1 spent
-      bookingBonus:       50,     // extra points for completing a booking
-      signupBonus:        100,    // points on first registration
+      pointsPerRand:      1,      // 1 point per R1 spent on bookings only
+      bookingBonus:       0,      // no extra bonus per booking
+      signupBonus:        0,      // no welcome points on registration
       pointValue:         0.10,   // 1 point = R0.10 discount (100 pts = R10)
       minRedemption:      100,    // minimum points to redeem
       maxRedemptionPct:   50,     // max % of order value that can be paid with points
@@ -2607,6 +2812,9 @@ ${urlEntries}
 
     // ── Helper: get or create loyalty account ─────────────────────────────
     async function getLoyaltyAccount(userId) {
+      // Ensure userId is ObjectId
+      if (typeof userId === 'string') userId = new ObjectId(userId);
+      
       let account = await db.collection('LOYALTY').findOne({ userId });
       if (!account) {
         const now = new Date();
@@ -2630,6 +2838,10 @@ ${urlEntries}
     // ── Helper: award points ───────────────────────────────────────────────
     async function awardPoints(userId, points, reason, referenceId = null) {
       if (points <= 0) return;
+      
+      // Ensure userId is ObjectId
+      if (typeof userId === 'string') userId = new ObjectId(userId);
+      
       const now = new Date();
       await db.collection('LOYALTY_TRANSACTIONS').insertOne({
         userId, points, type: 'earn', reason, referenceId, createdAt: now,
@@ -2660,6 +2872,10 @@ ${urlEntries}
     // ── Helper: redeem points ──────────────────────────────────────────────
     async function redeemPoints(userId, points, reason, referenceId = null) {
       if (points <= 0) return;
+      
+      // Ensure userId is ObjectId
+      if (typeof userId === 'string') userId = new ObjectId(userId);
+      
       const now = new Date();
       await db.collection('LOYALTY_TRANSACTIONS').insertOne({
         userId, points: -points, type: 'redeem', reason, referenceId, createdAt: now,
@@ -2670,6 +2886,56 @@ ${urlEntries}
       );
       logger.info(`[LOYALTY] -${points} pts from user ${userId} — ${reason}`);
     }
+
+    // ── POST /loyalty/redeem-on-payment — redeem points when payment success page loads ──
+    app.post('/loyalty/redeem-on-payment', authenticateToken, async (req, res, next) => {
+      try {
+        const { appointmentId, pointsToRedeem } = req.body;
+        if (!appointmentId) return res.status(400).json({ success:false, error:'appointmentId required' });
+        if (!pointsToRedeem || parseInt(pointsToRedeem) < LOYALTY_CONFIG.minRedemption) {
+          return res.json({ success:true, data:{ redeemed:false, reason:'No points to redeem' } });
+        }
+
+        let apptId;
+        try { apptId = new ObjectId(appointmentId); } catch { return res.status(400).json({ success:false, error:'Invalid appointmentId' }); }
+
+        const userId = new ObjectId(req.user.userId);
+        const appt = await db.collection('APPOINTMENTS').findOne({ _id:apptId, userId });
+        if (!appt) return res.status(404).json({ success:false, error:'Appointment not found' });
+
+        const account = await getLoyaltyAccount(userId);
+        const pts = Math.min(parseInt(pointsToRedeem), account.points);
+
+        if (pts >= LOYALTY_CONFIG.minRedemption) {
+          const discount = parseFloat((pts * LOYALTY_CONFIG.pointValue).toFixed(2));
+          console.log(`[REDEEM ON PAYMENT] Redeeming ${pts} pts for user ${userId}`);
+          
+          await redeemPoints(userId, pts, `Redeemed on payment success — ${pts} pts = R${discount} off`, apptId);
+          console.log(`[REDEEM ON PAYMENT] ✅ Successfully redeemed ${pts} pts`);
+
+          // Update appointment with redemption info if not already set
+          await db.collection('APPOINTMENTS').updateOne(
+            { _id:apptId },
+            { $set:{ loyaltyPointsRedeemed:pts, loyaltyBalanceDiscount:discount, updatedAt:new Date() } }
+          );
+
+          return res.json({
+            success:true,
+            data:{
+              redeemed:true,
+              pointsRedeemed:pts,
+              discountAmount:discount,
+              remainingPoints:account.points-pts,
+            },
+          });
+        }
+
+        res.json({ success:true, data:{ redeemed:false, reason:'Points less than minimum' } });
+      } catch (err) { 
+        console.error('[REDEEM ON PAYMENT] Error:', err.message);
+        next(err); 
+      }
+    });
 
     // ── GET /loyalty/me — get current user's loyalty account ──────────────
     app.get('/loyalty/me', authenticateToken, async (req, res, next) => {
@@ -3106,8 +3372,8 @@ ${urlEntries}
     const REFERRAL_CONFIG = {
       referrerPoints:    200,   // points awarded to referrer when friend books
       refereeDiscount:   50,    // rand discount for the new friend's first order
-      signupBonus:       50,    // extra points to referrer on friend signup
-      maxReferrals:      null,  // null = unlimited
+      signupBonus:       0,     // no points on signup — only on first booking
+      maxReferrals:      null,
     };
 
     // Helper: generate unique referral code
@@ -3884,7 +4150,6 @@ ${urlEntries}
               const bcrypt = require('bcryptjs');
               const r2 = await db.collection('USERS').insertOne({ email: email.toLowerCase(), password: await bcrypt.hash(Math.random().toString(36), 10), firstName: sanitiseText(firstName, 50), lastName: sanitiseText(lastName, 50), phone: sanitiseText(phone, 20), role: 'user', isActive: true, isGuest: true, createdAt: new Date(), updatedAt: new Date() });
               userId = r2.insertedId;
-              try { await awardPoints(userId, LOYALTY_CONFIG.signupBonus, 'Welcome bonus — guest booking'); } catch {}
             } else { userId = existing._id; }
           }
 
@@ -3928,19 +4193,68 @@ ${urlEntries}
     // ──────────────────────────────────────────────────────────────────────
     app.post('/discount-codes/validate', authenticateToken, discountLimiter, async (req, res, next) => {
       try {
-        const { code, subtotal } = req.body;
+        const { code, subtotal, context } = req.body; // context: 'shop' | 'booking'
         if (!code) return res.status(400).json({ success:false, error:'Code is required' });
         const found = await db.collection('DISCOUNT_CODES').findOne({
           code: code.toUpperCase().trim(), isActive: true,
           $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
         });
         if (!found) return res.status(404).json({ success:false, error:'Invalid or expired discount code.' });
-        if (found.usageLimit && found.usedCount >= found.usageLimit) return res.status(400).json({ success:false, error:'This code has reached its usage limit.' });
-        if (found.minOrderAmount && subtotal < found.minOrderAmount) return res.status(400).json({ success:false, error:`This code requires a minimum order of R${found.minOrderAmount.toFixed(2)}.` });
+        if (found.usageLimit && found.usedCount >= found.usageLimit) return res.status(400).json({ success:false, error:'This code has already been used.' });
+        if (found.minOrderAmount && subtotal < found.minOrderAmount) return res.status(400).json({ success:false, error:`This code requires a minimum of R${found.minOrderAmount.toFixed(2)}.` });
+
+        // If code is tied to a specific user, enforce it
+        if (found.forUserId && String(found.forUserId) !== String(req.user.userId)) {
+          return res.status(403).json({ success:false, error:'This code is not valid for your account.' });
+        }
+
         const discountAmount = found.type === 'percentage'
           ? Math.round((subtotal * found.value / 100) * 100) / 100
           : Math.min(found.value, subtotal);
         res.json({ success:true, data:{ code:found.code, type:found.type, value:found.value, description:found.description, discountAmount } });
+      } catch (err) { next(err); }
+    });
+
+    // POST /discount-codes/validate-booking — validate a code against a booking's balance
+    app.post('/discount-codes/validate-booking', authenticateToken, discountLimiter, async (req, res, next) => {
+      try {
+        const { code, appointmentId } = req.body;
+        if (!code) return res.status(400).json({ success:false, error:'Code is required' });
+        if (!appointmentId?.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success:false, error:'Invalid appointment ID' });
+
+        const appt = await db.collection('APPOINTMENTS').findOne({ _id: new ObjectId(appointmentId), userId: new ObjectId(req.user.userId) });
+        if (!appt) return res.status(404).json({ success:false, error:'Appointment not found' });
+
+        const found = await db.collection('DISCOUNT_CODES').findOne({
+          code: code.toUpperCase().trim(), isActive: true,
+          $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
+        });
+        if (!found) return res.status(404).json({ success:false, error:'Invalid or expired discount code.' });
+        if (found.usageLimit && found.usedCount >= found.usageLimit) return res.status(400).json({ success:false, error:'This code has already been used.' });
+        if (found.forUserId && String(found.forUserId) !== String(req.user.userId)) {
+          return res.status(403).json({ success:false, error:'This code is not valid for your account.' });
+        }
+
+        const depositAmount = parseFloat(process.env.DEPOSIT_AMOUNT || 100);
+        const totalPrice    = parseFloat(appt.totalPrice?.toString() || 0);
+        const balance       = Math.max(0, totalPrice - depositAmount);
+
+        const discountAmount = found.type === 'percentage'
+          ? parseFloat((balance * found.value / 100).toFixed(2))
+          : Math.min(found.value, balance);
+
+        res.json({
+          success: true,
+          data: {
+            code:           found.code,
+            type:           found.type,
+            value:          found.value,
+            description:    found.description,
+            discountAmount,
+            balance,
+            newBalance:     Math.max(0, balance - discountAmount),
+          },
+        });
       } catch (err) { next(err); }
     });
 
