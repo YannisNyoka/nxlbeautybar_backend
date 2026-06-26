@@ -723,6 +723,21 @@ async function startServer() {
           const totalDuration = services.reduce((sum, s) => sum + s.durationMinutes, 0);
           const requestedSlots = generateSlotRange(req.body.time, totalDuration);
 
+          // ── 6 PM CUTOFF VALIDATION ───────────────────────────────────────
+          // Appointments can reach 6 PM (18:00) but cannot extend beyond it
+          if (requestedSlots.length > 0) {
+            const lastSlot = requestedSlots[requestedSlots.length - 1];
+            const [lastHour, lastMin] = lastSlot.split(':').map(Number);
+            // Block if last slot is after 18:00 (extends past 6 PM)
+            if (lastHour > 18 || (lastHour === 18 && lastMin > 0)) {
+              return res.status(400).json({
+                success: false,
+                error: `This appointment would end at ${lastSlot}, which is past our 6 PM closing time. Please contact NXL Beauty Bar at 068 511 3394 or WhatsApp us for special arrangements.`,
+              });
+            }
+          }
+          // ──────────────────────────────────────────────────────────────────
+
           // ── Overlap check ────────────────────────────────────────────────
           // Only confirmed (paid) appointments block slots.
           // Pending/unpaid appointments intentionally do NOT hold slots —
@@ -762,7 +777,22 @@ async function startServer() {
           else if (req.user?.userId) req.body.userId = new ObjectId(req.user.userId);
           if (req.body.userId) {
             const clientUser = await db.collection('USERS').findOne({ _id:req.body.userId }, { projection:{ firstName:1, lastName:1 } });
-            if (clientUser) req.body.userName = `${clientUser.firstName} ${clientUser.lastName}`;
+            if (clientUser && clientUser.firstName && clientUser.lastName) {
+              req.body.userName = `${clientUser.firstName} ${clientUser.lastName}`.trim();
+            } else if (clientUser) {
+              req.body.userName = clientUser.firstName || clientUser.lastName || 'Client';
+            } else {
+              req.body.userName = 'Client'; // fallback if user not found
+            }
+          }
+          // Ensure userName is NEVER undefined, null, or "undefined undefined"
+          if (!req.body.userName || 
+              req.body.userName === 'undefined' || 
+              req.body.userName === 'undefined undefined' ||
+              req.body.userName === 'null' ||
+              req.body.userName === 'null null' ||
+              req.body.userName.trim() === '') {
+            req.body.userName = 'Client';
           }
           if (req.body.paymentStatus && !['unpaid','deposit_paid','paid'].includes(req.body.paymentStatus)) return res.status(400).json({ success:false, error:'Invalid paymentStatus' });
           req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
@@ -979,6 +1009,19 @@ async function startServer() {
             const editDuration = editServices.reduce((sum, s) => sum + (s.durationMinutes || 30), 0);
             const editSlots    = generateSlotRange(newTime, editDuration);
 
+            // ── 6 PM CUTOFF VALIDATION (on edit) ───────────────────────────
+            if (editSlots.length > 0) {
+              const lastSlot = editSlots[editSlots.length - 1];
+              const [lastHour, lastMin] = lastSlot.split(':').map(Number);
+              if (lastHour > 18 || (lastHour === 18 && lastMin > 0)) {
+                return res.status(400).json({
+                  success: false,
+                  error: `This appointment would end at ${lastSlot}, which is past our 6 PM closing time. Please contact NXL Beauty Bar at 068 511 3394 or WhatsApp us for special arrangements.`,
+                });
+              }
+            }
+            // ────────────────────────────────────────────────────────────────
+
             const conflicts = await db.collection('APPOINTMENTS').find({
               date:       newDate,
               employeeId: typeof newEmployee === 'string' ? new ObjectId(newEmployee) : newEmployee,
@@ -1117,7 +1160,30 @@ async function startServer() {
             const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u]));
             const empMap = Object.fromEntries(employees.map(e => [e._id.toString(), e]));
             const svcMap = Object.fromEntries(services.map(s => [s._id.toString(), s]));
-            docs = docs.map(doc => ({ ...doc, userName: userMap[doc.userId.toString()]?.firstName + ' ' + userMap[doc.userId.toString()]?.lastName, user:userMap[doc.userId.toString()], employee:empMap[doc.employeeId.toString()], services:doc.serviceIds.map(id => svcMap[id.toString()]).filter(Boolean), totalDuration:doc.totalDuration || doc.serviceIds.reduce((sum, id) => { const svc = svcMap[id.toString()]; return sum + (svc?.durationMinutes || 0); }, 0) }));
+            docs = docs.map(doc => {
+              const user = userMap[doc.userId.toString()];
+              // Use database userName if it's valid, otherwise try to construct from user object
+              let displayName = doc.userName;
+              if (!displayName || displayName === 'undefined' || displayName === 'undefined undefined' || displayName === 'null' || displayName === 'null null' || displayName.trim() === '') {
+                if (user?.firstName && user?.lastName) {
+                  displayName = `${user.firstName} ${user.lastName}`;
+                } else if (user?.firstName) {
+                  displayName = user.firstName;
+                } else if (user?.lastName) {
+                  displayName = user.lastName;
+                } else {
+                  displayName = 'Client';
+                }
+              }
+              return { 
+                ...doc, 
+                userName: displayName, 
+                user, 
+                employee: empMap[doc.employeeId.toString()], 
+                services: doc.serviceIds.map(id => svcMap[id.toString()]).filter(Boolean), 
+                totalDuration: doc.totalDuration || doc.serviceIds.reduce((sum, id) => { const svc = svcMap[id.toString()]; return sum + (svc?.durationMinutes || 0); }, 0) 
+              };
+            });
           }
           res.status(200).json({ success:true, data:docs, total, page, pages: Math.ceil(total/limit), limit });
         } catch (err) { next(err); }
