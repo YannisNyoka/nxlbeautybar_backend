@@ -117,7 +117,6 @@ const corsOptions = {
   optionsSuccessStatus: 200
 };
 
-const refreshTokens = new Set();
 
 const logger = winston.createLogger({
   level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
@@ -247,6 +246,13 @@ const initCollections = async (db) => {
   await db.collection('NOTIFICATIONS').createIndex({ createdAt:-1 });
 
   await db.createCollection('AUDIT_LOG', { validator: { $jsonSchema: { bsonType:'object', required:['collection','documentId','action','performedBy','timestamp'], properties: { collection:{bsonType:'string'}, documentId:{bsonType:'objectId'}, action:{bsonType:'string'}, performedBy:{bsonType:'objectId'}, timestamp:{bsonType:'date'}, data:{bsonType:'object'} } } }, validationLevel:'strict' }).catch(()=>{});
+
+  // REFRESH_TOKENS — persisted so sessions survive server restarts/redeploys
+  // (previously an in-memory Set, which lost every session on every deploy).
+  // TTL index auto-removes documents once expiresAt passes.
+  await db.createCollection('REFRESH_TOKENS').catch(() => {});
+  await db.collection('REFRESH_TOKENS').createIndex({ token: 1 }, { unique: true });
+  await db.collection('REFRESH_TOKENS').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
   await db.createCollection('GALLERY').catch(()=>{});
   await db.collection('GALLERY').createIndex({ createdAt:-1 });
@@ -522,9 +528,10 @@ async function startServer() {
           if (!match) return res.status(400).json({ success:false, error:'Invalid credentials' });
           const normalizedRole = ['admin','user'].includes(user.role) ? user.role : 'user';
           if (normalizedRole !== user.role) await db.collection('USERS').updateOne({ _id:user._id }, { $set:{ role:normalizedRole, updatedAt:new Date() } });
+          await db.collection('USERS').updateOne({ _id:user._id }, { $inc:{ loginCount:1 }, $set:{ lastLoginAt:new Date() } });
           const token = jwt.sign({ userId:user._id, email:user.email, role:normalizedRole }, jwtSecret, { expiresIn:'1h' });
           const refreshToken = jwt.sign({ userId:user._id, email:user.email, role:normalizedRole }, jwtSecret, { expiresIn:'7d' });
-          refreshTokens.add(refreshToken);
+          await db.collection('REFRESH_TOKENS').insertOne({ token:refreshToken, userId:user._id, createdAt:new Date(), expiresAt:new Date(Date.now() + 7*24*60*60*1000) });
           res.status(200).json({ success:true, message:'Login successful', data:{ _id:user._id, email:user.email, firstName:user.firstName, lastName:user.lastName, role:normalizedRole }, token, refreshToken });
         } catch (err) { next(err); }
       }
@@ -647,7 +654,8 @@ async function startServer() {
       async (req, res, next) => {
         try {
           const { refreshToken } = req.body;
-          if (!refreshTokens.has(refreshToken)) return res.status(403).json({ success:false, error:'Invalid refresh token' });
+          const stored = await db.collection('REFRESH_TOKENS').findOne({ token:refreshToken });
+          if (!stored) return res.status(403).json({ success:false, error:'Invalid refresh token' });
           jwt.verify(refreshToken, jwtSecret, (err, user) => {
             if (err) return res.status(403).json({ success:false, error:'Invalid refresh token' });
             const token = jwt.sign({ userId:user.userId, email:user.email, role:user.role }, jwtSecret, { expiresIn:'1h' });
@@ -692,7 +700,17 @@ async function startServer() {
         : collectionName === 'PAYMENTS' ? [body('appointmentId').optional().isMongoId(), body('type').optional().isIn(['deposit','full']), body('amount').optional().isDecimal({ decimal_digits:'0,2' }).custom(v => parseFloat(v) > 0), body('method').optional().isIn(['cash','card','online']), body('status').optional().isIn(['pending','paid','refunded'])]
         : [];
 
-      app.post(`/${route}`, authenticateToken, ...validators, async (req, res, next) => {
+      // Only APPOINTMENTS may be written to by a non-admin caller (their own bookings,
+      // enforced via ownership checks inside the handlers below). Everything else
+      // (SERVICES/EMPLOYEES/AVAILABILITY/PAYMENTS) is salon-configuration or financial
+      // data and must be admin-only to create/edit.
+      const writeGate = collectionName === 'APPOINTMENTS' ? [] : [authorizeRole('admin')];
+      // PAYMENTS records are never legitimately read by a customer directly — real
+      // customer-facing payment flows go through the dedicated /payments and
+      // /payments/verify routes, not this generic collection.
+      const readGate  = collectionName === 'PAYMENTS' ? [authorizeRole('admin')] : [];
+
+      app.post(`/${route}`, authenticateToken, ...writeGate, ...validators, async (req, res, next) => {
         if (!db) return res.status(500).json({ success:false, error:'Database not connected' });
         const errors = validationResult(req);
         if (!errors.isEmpty()) return sendValidationError(res, errors.array());
@@ -773,8 +791,12 @@ async function startServer() {
           req.body.totalPrice   = Decimal128.fromString(totalPrice.toFixed(2));
           req.body.occupiedSlots = requestedSlots; // stored for fast conflict queries
           req.body.status = (req.body.paymentStatus === 'paid' || req.body.paymentStatus === 'deposit_paid') ? 'booked' : 'pending';
-          if (req.body.userId) req.body.userId = new ObjectId(req.body.userId);
+          // Only an admin may book on behalf of another user — everyone else's
+          // bookings are always attributed to the authenticated caller, regardless
+          // of what userId (if any) was submitted in the request body.
+          if (req.user?.role === 'admin' && req.body.userId) req.body.userId = new ObjectId(req.body.userId);
           else if (req.user?.userId) req.body.userId = new ObjectId(req.user.userId);
+          else delete req.body.userId;
           if (req.body.userId) {
             const clientUser = await db.collection('USERS').findOne({ _id:req.body.userId }, { projection:{ firstName:1, lastName:1 } });
             if (clientUser && clientUser.firstName && clientUser.lastName) {
@@ -796,6 +818,16 @@ async function startServer() {
           }
           if (req.body.paymentStatus && !['unpaid','deposit_paid','paid'].includes(req.body.paymentStatus)) return res.status(400).json({ success:false, error:'Invalid paymentStatus' });
           req.body.paymentStatus = req.body.paymentStatus || 'unpaid';
+          // Contact number is collected per-booking in the UI but belongs on the
+          // client's profile, not the appointment — save it there so it's on
+          // file for SMS/WhatsApp reminders, then drop it from the appointment
+          // doc (previously it was just dropped, never saved anywhere).
+          if (req.body.contactNumber && req.body.userId) {
+            const digits = String(req.body.contactNumber).replace(/\D/g, '');
+            if (digits.length >= 9) {
+              await db.collection('USERS').updateOne({ _id:req.body.userId }, { $set:{ phone: sanitiseText(req.body.contactNumber, 20), updatedAt:new Date() } });
+            }
+          }
           delete req.body.totalDuration; delete req.body.contactNumber; delete req.body.stylist; delete req.body.manicureType; delete req.body.pedicureType;
           if (req.body.notes) req.body.notes = sanitiseText(req.body.notes, 500);
         }
@@ -904,64 +936,10 @@ async function startServer() {
           if (collectionName === 'PAYMENTS') {
             const nextStatus = req.body.type === 'deposit' ? 'deposit_paid' : 'paid';
             await db.collection('APPOINTMENTS').updateOne({ _id:req.body.appointmentId }, { $set:{ paymentStatus:nextStatus, updatedAt:new Date() } });
-
-            // ── SMS confirmation after booking payment ────────────────────
-          try {
-            const apptForSMS = await db.collection('APPOINTMENTS').findOne({ _id: req.body.appointmentId });
-            const clientForSMS = await db.collection('USERS').findOne({ _id: apptForSMS?.userId });
-            if (clientForSMS?.phone) {
-              const svcs = await db.collection('SERVICES').find({ _id:{ $in: apptForSMS.serviceIds||[] } }).project({ name:1 }).toArray();
-              const svcNames = svcs.map(s => s.name).join(', ');
-              await sendSMS(clientForSMS.phone,
-                `NXL Beauty Bar: Payment confirmed! Your appointment for ${svcNames} on ${apptForSMS.date} at ${apptForSMS.time} is booked. See you soon! 💅`
-              );
+            if (req.body.status === 'paid') {
+              try { await handleBookingPaymentConfirmed(req.body.appointmentId, parseFloat(req.body.amount || 0)); }
+              catch (confirmErr) { logger.error(`[PAYMENTS] Booking confirmation side effects failed: ${confirmErr.message}`); }
             }
-            // In-app notification
-            if (apptForSMS?.userId) {
-              const svcs2    = apptForSMS._svcs || await db.collection('SERVICES').find({ _id:{ $in: apptForSMS.serviceIds||[] } }).project({ name:1 }).toArray();
-              const svcNames = svcs2.map(s => s.name).join(', ');
-              await notifyClient(apptForSMS.userId, {
-                type:  'booking_confirmed',
-                title: 'Booking Confirmed ✅',
-                body:  `Your appointment for ${svcNames} on ${apptForSMS.date} at ${apptForSMS.time} is confirmed.`,
-                link:  '/dashboard',
-              });
-            }
-          } catch (smsErr) { logger.error(`[SMS] Booking confirm failed: ${smsErr.message}`); }
-          // ──────────────────────────────────────────────────────────────
-
-          // ── Award loyalty points for booking payment ──────────────────
-            try {
-              const apptForPoints = await db.collection('APPOINTMENTS').findOne({ _id: req.body.appointmentId });
-              if (apptForPoints?.userId) {
-                const amountPaid  = parseFloat(req.body.amount || 0);
-                const earnedPts   = Math.floor(amountPaid * LOYALTY_CONFIG.pointsPerRand) + LOYALTY_CONFIG.bookingBonus;
-                await awardPoints(apptForPoints.userId, earnedPts, `Booking payment — ${amountPaid.toFixed(2)} ZAR`, req.body.appointmentId);
-
-                // ── Referral reward — first completed booking ─────────────
-                try {
-                  const booker = await db.collection('USERS').findOne({ _id: apptForPoints.userId }, { projection: { referredBy:1, firstName:1, referralRewardGiven:1 } });
-                  if (booker?.referredBy && !booker.referralRewardGiven) {
-                    await awardPoints(booker.referredBy, REFERRAL_CONFIG.referrerPoints, `Referral reward — ${booker.firstName} completed first booking`);
-                    await db.collection('REFERRALS').updateOne(
-                      { referrerId: booker.referredBy, refereeId: apptForPoints.userId },
-                      { $set: { status: 'rewarded', pointsAwarded: REFERRAL_CONFIG.referrerPoints, rewardedAt: new Date(), updatedAt: new Date() } }
-                    );
-                    await db.collection('USERS').updateOne({ _id: apptForPoints.userId }, { $set: { referralRewardGiven: true } });
-                    await notifyClient(booker.referredBy, {
-                      type:  'loyalty_earned',
-                      title: `Referral reward — +${REFERRAL_CONFIG.referrerPoints} points! 🏆`,
-                      body:  `${booker.firstName} completed their first booking. You earned ${REFERRAL_CONFIG.referrerPoints} loyalty points!`,
-                      link:  '/profile',
-                      meta:  { points: REFERRAL_CONFIG.referrerPoints },
-                    });
-                    logger.info(`[REFERRAL] Rewarded referrer for ${booker.firstName}'s first booking`);
-                  }
-                } catch (refErr) { logger.error(`[REFERRAL] First booking reward failed: ${refErr.message}`); }
-                // ─────────────────────────────────────────────────────────
-              }
-            } catch (loyaltyErr) { logger.error(`[LOYALTY] Booking award failed: ${loyaltyErr.message}`); }
-            // ─────────────────────────────────────────────────────────────
           }
           res.status(201).json({ success:true, message:'Created', data:{ _id:result.insertedId, ...req.body } });
         } catch (err) {
@@ -971,7 +949,7 @@ async function startServer() {
         }
       });
 
-      app.put(`/${route}/:id`, authenticateToken, idValidator, ...putValidators, async (req, res, next) => {
+      app.put(`/${route}/:id`, authenticateToken, ...writeGate, idValidator, ...putValidators, async (req, res, next) => {
         if (!db) return res.status(500).json({ success:false, error:'Database not connected' });
         const errors = validationResult(req);
         if (!errors.isEmpty()) return sendValidationError(res, errors.array());
@@ -992,6 +970,18 @@ async function startServer() {
         if (collectionName === 'APPOINTMENTS') {
           const appt = await db.collection('APPOINTMENTS').findOne({ _id:new ObjectId(req.params.id) });
           if (!appt) return res.status(404).json({ success:false, error:'Appointment not found' });
+          const isOwnerAdmin = req.user?.role === 'admin';
+          if (!isOwnerAdmin && String(appt.userId) !== String(req.user.userId)) {
+            return res.status(403).json({ success:false, error:'You do not have permission to modify this appointment' });
+          }
+          if (!isOwnerAdmin) {
+            // A customer may only reschedule (date/time/employeeId/serviceIds/notes) or
+            // cancel their own booking — never set payment/pricing fields directly.
+            delete req.body.paymentStatus; delete req.body.totalPrice; delete req.body.occupiedSlots; delete req.body.userId; delete req.body.paymentMethod;
+            if (req.body.status && req.body.status !== 'cancelled') {
+              return res.status(403).json({ success:false, error:'You may only cancel your own appointment, not change its status.' });
+            }
+          }
           const validTransitions = { pending:['pending','booked','cancelled'], booked:['booked','cancelled','completed','no-show'], cancelled:['cancelled'], completed:['completed'], 'no-show':['no-show'] };
           if (req.body.status && !validTransitions[appt.status]?.includes(req.body.status)) return res.status(400).json({ success:false, error:'Invalid status transition' });
 
@@ -1138,7 +1128,7 @@ async function startServer() {
         }
       });
 
-      app.get(`/${route}`, authenticateToken, async (req, res, next) => {
+      app.get(`/${route}`, authenticateToken, ...readGate, async (req, res, next) => {
         if (!db) return res.status(500).json({ success:false, error:'Database not connected' });
         try {
           // ── Pagination support ──────────────────────────────────────────
@@ -1146,8 +1136,12 @@ async function startServer() {
           const limit = Math.min(500, Math.max(1, parseInt(req.query.limit || '500', 10)));
           const skip  = (page - 1) * limit;
 
-          const total = await db.collection(collectionName).countDocuments({});
-          let docs = await db.collection(collectionName).find({}).sort({ createdAt:-1 }).skip(skip).limit(limit).toArray();
+          // A non-admin caller may only ever list their own appointments.
+          const ownFilter = (collectionName === 'APPOINTMENTS' && req.user?.role !== 'admin')
+            ? { userId: new ObjectId(req.user.userId) } : {};
+
+          const total = await db.collection(collectionName).countDocuments(ownFilter);
+          let docs = await db.collection(collectionName).find(ownFilter).sort({ createdAt:-1 }).skip(skip).limit(limit).toArray();
           // ────────────────────────────────────────────────────────────────
 
           if (collectionName === 'APPOINTMENTS') {
@@ -1189,13 +1183,16 @@ async function startServer() {
         } catch (err) { next(err); }
       });
 
-      app.get(`/${route}/:id`, authenticateToken, idValidator, async (req, res, next) => {
+      app.get(`/${route}/:id`, authenticateToken, ...readGate, idValidator, async (req, res, next) => {
         if (!db) return res.status(500).json({ success:false, error:'Database not connected' });
         const errors = validationResult(req);
         if (!errors.isEmpty()) return sendValidationError(res, errors.array());
         try {
           let doc = await db.collection(collectionName).findOne({ _id:new ObjectId(req.params.id) });
           if (!doc) return res.status(404).json({ success:false, error:'Document not found' });
+          if (collectionName === 'APPOINTMENTS' && req.user?.role !== 'admin' && String(doc.userId) !== String(req.user.userId)) {
+            return res.status(403).json({ success:false, error:'You do not have permission to view this appointment' });
+          }
           if (collectionName === 'APPOINTMENTS') {
             const user = await db.collection('USERS').findOne({ _id:doc.userId }, { projection:{ password:0 } });
             const employee = await db.collection('EMPLOYEES').findOne({ _id:doc.employeeId });
@@ -1287,6 +1284,55 @@ async function startServer() {
       } catch (err) { logger.error('Yoco payment init error:', err); next(err); }
     });
 
+    // ── POST /payments/manual — admin records a cash/card payment taken in person ──
+    // (Registered as a distinct path so it can never be shadowed by the customer-
+    // facing Yoco-checkout route above, which also listens on POST /payments.)
+    app.post('/payments/manual', authenticateToken, authorizeRole('admin'),
+      body('appointmentId').isMongoId(),
+      body('type').optional().isIn(['deposit','full']),
+      body('amount').isDecimal({ decimal_digits:'0,2' }).custom(v => parseFloat(v) > 0),
+      body('method').isIn(['cash','card','online']),
+      body('status').isIn(['pending','paid','refunded']),
+      async (req, res, next) => {
+        try {
+          const errors = validationResult(req);
+          if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+          const appointmentId = new ObjectId(req.body.appointmentId);
+          const appt = await db.collection('APPOINTMENTS').findOne({ _id:appointmentId });
+          if (!appt) return res.status(400).json({ success:false, error:'Appointment does not exist' });
+
+          const paymentType   = req.body.type || 'full';
+          const depositAmount = decimalToNumber(process.env.DEPOSIT_AMOUNT ?? 100);
+          const paidAmount    = decimalToNumber(req.body.amount);
+          const total         = decimalToNumber(appt.totalPrice);
+          if (paidAmount == null || total == null) return res.status(400).json({ success:false, error:'Invalid payment amount' });
+          if (paymentType === 'deposit') {
+            if (depositAmount == null || paidAmount !== depositAmount) return res.status(400).json({ success:false, error:`Deposit must be ${depositAmount?.toFixed?.(2) ?? depositAmount}` });
+            if (paidAmount > total) return res.status(400).json({ success:false, error:'Deposit cannot exceed appointment totalPrice' });
+          } else if (paidAmount !== total) {
+            return res.status(400).json({ success:false, error:'Payment amount must match appointment totalPrice' });
+          }
+
+          const exists = await db.collection('PAYMENTS').findOne({ appointmentId, type:paymentType });
+          if (exists) return res.status(400).json({ success:false, error:'Payment already exists for this appointment' });
+
+          const result = await db.collection('PAYMENTS').insertOne({
+            appointmentId, type:paymentType,
+            amount: Decimal128.fromString(paidAmount.toFixed(2)),
+            method: req.body.method, status: req.body.status,
+            currency: 'ZAR', createdAt: new Date(), updatedAt: new Date(),
+          });
+
+          if (req.body.status === 'paid') {
+            const nextStatus = paymentType === 'deposit' ? 'deposit_paid' : 'paid';
+            await db.collection('APPOINTMENTS').updateOne({ _id:appointmentId }, { $set:{ paymentStatus:nextStatus, status:'booked', updatedAt:new Date() } });
+          }
+
+          res.status(201).json({ success:true, message:'Payment recorded', data:{ _id:result.insertedId, appointmentId, type:paymentType, amount:paidAmount, method:req.body.method, status:req.body.status } });
+        } catch (err) { next(err); }
+      }
+    );
+
     // ── GET /loyalty/booking-preview/:appointmentId — how many pts can be used ──
     app.get('/loyalty/booking-preview/:id', authenticateToken, async (req, res, next) => {
       try {
@@ -1327,6 +1373,77 @@ async function startServer() {
       } catch (err) { next(err); }
     });
     // ──────────────────────────────────────────────────────────────────────
+
+    // ── Server-to-server confirmation that a Yoco checkout actually succeeded.
+    // Every "verify"/"confirm" endpoint below must call this before flipping a
+    // record to paid/active — never trust the client's say-so alone.
+    async function verifyYocoCheckout(checkoutId) {
+      if (!checkoutId) return { verified:false, status:'no_checkout_id' };
+      try {
+        const resp = await fetchFn(`https://payments.yoco.com/api/checkouts/${checkoutId}`, {
+          headers: { 'Authorization': `Bearer ${process.env.YOCO_SECRET_KEY}` },
+        });
+        if (!resp.ok) { logger.error('Yoco checkout lookup failed', { checkoutId, status:resp.status }); return { verified:false, status:'lookup_failed' }; }
+        const data = await resp.json();
+        return { verified: data.status === 'completed', status: data.status };
+      } catch (err) {
+        logger.error('Yoco checkout verification error', { checkoutId, error:err.message });
+        return { verified:false, status:'error' };
+      }
+    }
+
+    // ── Side effects that must fire exactly once when a booking deposit is
+    // first confirmed paid — called from both /payments/verify and the Yoco
+    // webhook, each of which already guards against re-entering this for the
+    // same appointment. Awards loyalty points, sends the SMS + in-app
+    // "booking confirmed" notification, and pays a first-booking referral
+    // reward if applicable. (Previously this logic only existed inside a
+    // POST /payments handler that was dead code — shadowed by the earlier
+    // POST /payments route used to create the Yoco checkout — so none of it
+    // ever actually ran for a real paid booking.)
+    async function handleBookingPaymentConfirmed(appointmentId, amountPaid) {
+      const appt = await db.collection('APPOINTMENTS').findOne({ _id: appointmentId });
+      if (!appt?.userId) return;
+
+      try {
+        const client = await db.collection('USERS').findOne({ _id: appt.userId });
+        const svcs = await db.collection('SERVICES').find({ _id: { $in: appt.serviceIds || [] } }).project({ name: 1 }).toArray();
+        const svcNames = svcs.map(s => s.name).join(', ');
+        if (client?.phone) {
+          await sendSMS(client.phone, `NXL Beauty Bar: Payment confirmed! Your appointment for ${svcNames} on ${appt.date} at ${appt.time} is booked. See you soon! 💅`);
+        }
+        await notifyClient(appt.userId, {
+          type:  'booking_confirmed',
+          title: 'Booking Confirmed ✅',
+          body:  `Your appointment for ${svcNames} on ${appt.date} at ${appt.time} is confirmed.`,
+          link:  '/dashboard',
+        });
+      } catch (notifErr) { logger.error(`[BOOKING CONFIRM] Notification failed: ${notifErr.message}`); }
+
+      try {
+        const earnedPts = Math.floor(amountPaid * LOYALTY_CONFIG.pointsPerRand) + LOYALTY_CONFIG.bookingBonus;
+        await awardPoints(appt.userId, earnedPts, `Booking deposit — R${amountPaid.toFixed(2)}`, appointmentId);
+
+        const booker = await db.collection('USERS').findOne({ _id: appt.userId }, { projection: { referredBy: 1, firstName: 1, referralRewardGiven: 1 } });
+        if (booker?.referredBy && !booker.referralRewardGiven) {
+          await awardPoints(booker.referredBy, REFERRAL_CONFIG.referrerPoints, `Referral reward — ${booker.firstName} completed first booking`);
+          await db.collection('REFERRALS').updateOne(
+            { referrerId: booker.referredBy, refereeId: appt.userId },
+            { $set: { status: 'rewarded', pointsAwarded: REFERRAL_CONFIG.referrerPoints, rewardedAt: new Date(), updatedAt: new Date() } }
+          );
+          await db.collection('USERS').updateOne({ _id: appt.userId }, { $set: { referralRewardGiven: true } });
+          await notifyClient(booker.referredBy, {
+            type:  'loyalty_earned',
+            title: `Referral reward — +${REFERRAL_CONFIG.referrerPoints} points! 🏆`,
+            body:  `${booker.firstName} completed their first booking. You earned ${REFERRAL_CONFIG.referrerPoints} loyalty points!`,
+            link:  '/profile',
+            meta:  { points: REFERRAL_CONFIG.referrerPoints },
+          });
+          logger.info(`[REFERRAL] Rewarded referrer for ${booker.firstName}'s first booking`);
+        }
+      } catch (loyaltyErr) { logger.error(`[LOYALTY] Booking award failed: ${loyaltyErr.message}`); }
+    }
+
     app.post('/payments/verify', authenticateToken, async (req, res, next) => {
       try {
         const { appointmentId, loyaltyPointsToRedeem, discountCode } = req.body;
@@ -1335,53 +1452,56 @@ async function startServer() {
         try { apptId = new ObjectId(appointmentId); } catch { return res.status(400).json({ success:false, error:'Invalid appointmentId' }); }
         const appt = await db.collection('APPOINTMENTS').findOne({ _id:apptId });
         if (!appt) return res.status(404).json({ success:false, error:'Appointment not found' });
+        if (req.user?.role !== 'admin' && String(appt.userId) !== String(req.user.userId)) {
+          return res.status(403).json({ success:false, error:'You do not have permission to verify this payment' });
+        }
         if (appt.status === 'booked' && appt.paymentStatus === 'deposit_paid') { return res.json({ success:true, alreadyConfirmed:true }); }
+
+        const paymentRecord = await db.collection('PAYMENTS').findOne({ appointmentId:apptId });
+        const { verified, status } = await verifyYocoCheckout(paymentRecord?.yocoCheckoutId);
+        if (!verified) {
+          logger.info('Payment verify: Yoco checkout not yet completed', { appointmentId, yocoStatus:status });
+          return res.json({ success:true, alreadyConfirmed:false, pending:true });
+        }
+
         await db.collection('APPOINTMENTS').updateOne({ _id:apptId }, { $set:{ status:'booked', paymentStatus:'deposit_paid', updatedAt:new Date() } });
         await db.collection('PAYMENTS').updateOne({ appointmentId:apptId, status:{ $ne:'paid' } }, { $set:{ status:'paid', paidAt:new Date(), updatedAt:new Date() } });
+
+        // ── Award loyalty points, send confirmation SMS/notification, pay
+        // referral reward — only runs once per appointment (the alreadyConfirmed
+        // check above short-circuits any repeat call for this same booking).
+        try {
+          const depositAmount = parseFloat(process.env.DEPOSIT_AMOUNT || 100);
+          await handleBookingPaymentConfirmed(apptId, depositAmount);
+        } catch (confirmErr) { logger.error(`[PAYMENT VERIFY] Booking confirmation side effects failed: ${confirmErr.message}`); }
 
         // ── Redeem loyalty points against balance (not deposit) ───────────
         if (loyaltyPointsToRedeem && parseInt(loyaltyPointsToRedeem) >= LOYALTY_CONFIG.minRedemption) {
           try {
-            const userId   = appt.userId;
-            console.log(`[LOYALTY REDEEM] Starting - userId: ${userId}, loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}`);
-            
-            const account  = await getLoyaltyAccount(userId);
-            console.log(`[LOYALTY REDEEM] Account fetched - currentPoints: ${account.points}`);
-            
-            const pts      = Math.min(parseInt(loyaltyPointsToRedeem), account.points);
-            console.log(`[LOYALTY REDEEM] Calculated pts to redeem: ${pts}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
-            
+            const userId  = appt.userId;
+            const account = await getLoyaltyAccount(userId);
+            const pts     = Math.min(parseInt(loyaltyPointsToRedeem), account.points);
+
             if (pts >= LOYALTY_CONFIG.minRedemption) {
               const discount = parseFloat((pts * LOYALTY_CONFIG.pointValue).toFixed(2));
-              console.log(`[LOYALTY REDEEM] About to call redeemPoints with pts=${pts}, discount=${discount}`);
-              
               await redeemPoints(userId, pts, `Redeemed against balance — ${pts} pts = R${discount} off at salon`, apptId);
-              console.log(`[LOYALTY REDEEM] redeemPoints completed successfully`);
-              
+
               // Store on appointment so admin can see and deduct from balance due
               await db.collection('APPOINTMENTS').updateOne(
                 { _id: apptId },
                 { $set: { loyaltyPointsRedeemed: pts, loyaltyBalanceDiscount: discount, updatedAt: new Date() } }
               );
-              console.log(`[LOYALTY REDEEM] Appointment updated with redemption info`);
-              
+
               await notifyClient(userId, {
                 type:  'loyalty_redeemed',
                 title: `${pts} Points Redeemed 🎁`,
                 body:  `R${discount} will be deducted from your balance due at the salon.`,
                 link:  '/dashboard',
               });
-              console.log(`[LOYALTY REDEEM] Client notified`);
-            } else {
-              console.log(`[LOYALTY REDEEM] pts=${pts} is less than minRedemption=${LOYALTY_CONFIG.minRedemption}, skipping redemption`);
             }
-          } catch (lErr) { 
-            console.error(`[LOYALTY REDEEM] ERROR: ${lErr.message}`);
-            console.error(`[LOYALTY REDEEM] Stack: ${lErr.stack}`);
-            logger.error(`[LOYALTY] Booking redemption failed: ${lErr.message}`); 
+          } catch (lErr) {
+            logger.error(`[LOYALTY] Booking redemption failed: ${lErr.message}`, { stack:lErr.stack });
           }
-        } else {
-          console.log(`[LOYALTY REDEEM] Condition not met - loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
         }
         // ──────────────────────────────────────────────────────────────────
 
@@ -1421,61 +1541,61 @@ async function startServer() {
     });
 
     app.post('/payments/webhook', (req, res) => {
+      // ── Verify the signature BEFORE acknowledging or processing anything.
+      // A mismatch here means the request did not genuinely come from Yoco —
+      // reject it outright rather than logging and continuing.
+      const event = req.body;
+      if (!event?.type) { logger.error('Yoco webhook: empty or malformed body'); return res.status(400).send('Bad Request'); }
+      const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
+      const wSig = req.headers['webhook-signature'] || req.headers['svix-signature'];
+      const wTimestamp = req.headers['webhook-timestamp'] || req.headers['svix-timestamp'];
+      const wId = req.headers['webhook-id'] || req.headers['svix-id'];
+      const yocoSig = req.headers['x-yoco-signature'];
+      if (webhookSecret) {
+        let verified = false;
+        if (wSig && wTimestamp && wId && req.rawBody) {
+          const toSign = `${wId}.${wTimestamp}.${req.rawBody.toString('utf8')}`;
+          const secretBytes = Buffer.from(webhookSecret.startsWith('whsec_') ? webhookSecret.slice(6) : webhookSecret, 'base64');
+          const expected = crypto.createHmac('sha256', secretBytes).update(toSign).digest('base64');
+          verified = wSig.split(' ').some(part => { const [, sigB64] = part.split(','); return sigB64 === expected; });
+        } else if (yocoSig && req.rawBody) {
+          const expected = crypto.createHmac('sha256', webhookSecret).update(req.rawBody).digest('hex');
+          verified = yocoSig === expected;
+        }
+        if (!verified) {
+          logger.error('Yoco webhook: signature verification failed — rejecting', { wId });
+          return res.status(401).send('Invalid signature');
+        }
+      }
+
       res.status(200).send('OK');
       setImmediate(async () => {
         try {
-          const event = req.body;
-          console.log('[WEBHOOK DEBUG] Full event received:', JSON.stringify(event, null, 2));
           logger.info('Yoco webhook received', { type:event.type, payloadId:event.payload?.id });
-          if (!event?.type) { logger.error('Yoco webhook: empty or malformed body'); return; }
-          const webhookSecret = process.env.YOCO_WEBHOOK_SECRET;
-          const wSig = req.headers['webhook-signature'] || req.headers['svix-signature'];
-          const wTimestamp = req.headers['webhook-timestamp'] || req.headers['svix-timestamp'];
-          const wId = req.headers['webhook-id'] || req.headers['svix-id'];
-          const yocoSig = req.headers['x-yoco-signature'];
-          if (webhookSecret) {
-            if (wSig && wTimestamp && wId) {
-              if (req.rawBody) {
-                const toSign = `${wId}.${wTimestamp}.${req.rawBody.toString('utf8')}`;
-                const secretBytes = Buffer.from(webhookSecret.startsWith('whsec_') ? webhookSecret.slice(6) : webhookSecret, 'base64');
-                const expected = crypto.createHmac('sha256', secretBytes).update(toSign).digest('base64');
-                const matched = wSig.split(' ').some(part => { const [, sigB64] = part.split(','); return sigB64 === expected; });
-                if (!matched) logger.error('Yoco webhook: signature mismatch — processing anyway', { wId });
-              }
-            } else if (yocoSig && req.rawBody) {
-              const expected = crypto.createHmac('sha256', webhookSecret).update(req.rawBody).digest('hex');
-              if (yocoSig !== expected) logger.error('Yoco webhook: x-yoco-signature mismatch — processing anyway');
-            }
-          }
           if (event.type === 'payment.succeeded') {
             const appointmentId = event.metadata?.appointmentId || event.payload?.metadata?.appointmentId;
             const checkoutId = event.payloadId || event.payload?.id;
             let loyaltyPointsToRedeem = event.metadata?.loyaltyPointsToRedeem || event.payload?.metadata?.loyaltyPointsToRedeem;
             let discountCode = event.metadata?.discountCode || event.payload?.metadata?.discountCode;
-            
-            console.log('[WEBHOOK DEBUG] Extracted from event:', { appointmentId, checkoutId, loyaltyPointsToRedeem, discountCode });
-            console.log('[WEBHOOK DEBUG] event.metadata:', event.metadata);
-            console.log('[WEBHOOK DEBUG] event.payload?.metadata:', event.payload?.metadata);
-            
-            // FIX: If metadata not in webhook, fetch from PAYMENTS collection
+
+            // If metadata wasn't included in the webhook itself, fall back to what
+            // was snapshotted on the PAYMENTS record when the checkout was created.
             if (!loyaltyPointsToRedeem || !discountCode) {
               try {
                 let apptIdObj;
                 try { apptIdObj = new ObjectId(appointmentId); } catch { apptIdObj = null; }
                 if (apptIdObj) {
                   const paymentRecord = await db.collection('PAYMENTS').findOne({ appointmentId: apptIdObj });
-                  console.log('[WEBHOOK DEBUG] Fetched PAYMENTS record apptSnapshot:', paymentRecord?.apptSnapshot);
                   if (paymentRecord?.apptSnapshot) {
                     loyaltyPointsToRedeem = loyaltyPointsToRedeem || paymentRecord.apptSnapshot.loyaltyPointsToRedeem;
                     discountCode = discountCode || paymentRecord.apptSnapshot.discountCode;
-                    console.log('[WEBHOOK DEBUG] Updated from PAYMENTS:', { loyaltyPointsToRedeem, discountCode });
                   }
                 }
               } catch (fetchErr) {
-                console.error('[WEBHOOK DEBUG] Error fetching PAYMENTS record:', fetchErr.message);
+                logger.error('Yoco webhook: failed to backfill metadata from PAYMENTS record', { error:fetchErr.message });
               }
             }
-            
+
             if (event.payload?.metadata?.type === 'shop_order') {
               const shopOrderId = event.payload?.metadata?.orderId;
               if (shopOrderId) {
@@ -1508,52 +1628,45 @@ async function startServer() {
               }
             }
 
+            // ── Award loyalty points, send confirmation SMS/notification, pay
+            // referral reward — only runs once per appointment (the alreadyPaid
+            // check above short-circuits any repeat webhook delivery for this
+            // same booking, and the corresponding check in /payments/verify
+            // does the same if that path processes the payment first).
+            try {
+              await handleBookingPaymentConfirmed(apptId, depositAmount);
+            } catch (confirmErr) { logger.error(`Yoco webhook: booking confirmation side effects failed: ${confirmErr.message}`); }
+
             // ── REDEEM LOYALTY POINTS ─────────────────────────────────────
             if (loyaltyPointsToRedeem && parseInt(loyaltyPointsToRedeem) >= LOYALTY_CONFIG.minRedemption) {
               try {
                 const appt = await db.collection('APPOINTMENTS').findOne({ _id: apptId });
                 if (appt) {
                   const userId = appt.userId;
-                  console.log(`[WEBHOOK LOYALTY] Starting - userId: ${userId}, loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}`);
-                  
                   const account = await getLoyaltyAccount(userId);
-                  console.log(`[WEBHOOK LOYALTY] Account fetched - currentPoints: ${account.points}`);
-                  
                   const pts = Math.min(parseInt(loyaltyPointsToRedeem), account.points);
-                  console.log(`[WEBHOOK LOYALTY] Calculated pts to redeem: ${pts}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
-                  
+
                   if (pts >= LOYALTY_CONFIG.minRedemption) {
                     const discount = parseFloat((pts * LOYALTY_CONFIG.pointValue).toFixed(2));
-                    console.log(`[WEBHOOK LOYALTY] About to call redeemPoints with pts=${pts}, discount=${discount}`);
-                    
                     await redeemPoints(userId, pts, `Redeemed against balance — ${pts} pts = R${discount} off at salon`, apptId);
-                    console.log(`[WEBHOOK LOYALTY] redeemPoints completed successfully`);
-                    
+
                     // Store result on appointment
                     await db.collection('APPOINTMENTS').updateOne(
                       { _id: apptId },
                       { $set: { loyaltyPointsRedeemed: pts, loyaltyBalanceDiscount: discount, updatedAt: new Date() } }
                     );
-                    console.log(`[WEBHOOK LOYALTY] Appointment updated with redemption info`);
-                    
+
                     await notifyClient(userId, {
                       type:  'loyalty_redeemed',
                       title: `${pts} Points Redeemed 🎁`,
                       body:  `R${discount} will be deducted from your balance due at the salon.`,
                       link:  '/dashboard',
                     });
-                    console.log(`[WEBHOOK LOYALTY] Client notified`);
-                  } else {
-                    console.log(`[WEBHOOK LOYALTY] pts=${pts} is less than minRedemption=${LOYALTY_CONFIG.minRedemption}, skipping redemption`);
                   }
                 }
               } catch (loyaltyErr) {
-                console.error(`[WEBHOOK LOYALTY] ERROR: ${loyaltyErr.message}`);
-                console.error(`[WEBHOOK LOYALTY] Stack: ${loyaltyErr.stack}`);
-                logger.error(`[WEBHOOK LOYALTY] Webhook redemption failed: ${loyaltyErr.message}`);
+                logger.error(`[WEBHOOK LOYALTY] Webhook redemption failed: ${loyaltyErr.message}`, { stack:loyaltyErr.stack });
               }
-            } else {
-              console.log(`[WEBHOOK LOYALTY] Condition not met - loyaltyPointsToRedeem: ${loyaltyPointsToRedeem}, minRedemption: ${LOYALTY_CONFIG.minRedemption}`);
             }
             // ─────────────────────────────────────────────────────────────
           }
@@ -1605,15 +1718,78 @@ async function startServer() {
       } catch (err) { next(err); }
     });
 
+    // ── GET /users/:id/profile — full admin-side client profile ───────────
+    // Aggregates everything an admin needs about a client in one call:
+    // account info, visit/login count, service history, loyalty, orders, referrals.
+    app.get('/users/:id/profile', authenticateToken, authorizeRole('admin'), idValidator, async (req, res, next) => {
+      try {
+        const userId = new ObjectId(req.params.id);
+        const user = await db.collection('USERS').findOne({ _id:userId }, { projection:{ password:0 } });
+        if (!user) return res.status(404).json({ success:false, error:'User not found' });
+
+        const [appointments, orders, loyaltyAccount, loyaltyTxns, referralsMade, referredBy] = await Promise.all([
+          db.collection('APPOINTMENTS').find({ userId }).sort({ date:-1 }).toArray(),
+          db.collection('ORDERS').find({ userId }).sort({ createdAt:-1 }).toArray(),
+          getLoyaltyAccount(userId),
+          db.collection('LOYALTY_TRANSACTIONS').find({ userId }).sort({ createdAt:-1 }).limit(50).toArray(),
+          db.collection('REFERRALS').countDocuments({ referrerId:userId, status:'rewarded' }),
+          user.referredBy ? db.collection('USERS').findOne({ _id:user.referredBy }, { projection:{ firstName:1, lastName:1 } }) : null,
+        ]);
+
+        const serviceIds = [...new Set(appointments.flatMap(a => a.serviceIds || []))];
+        const employeeIds = [...new Set(appointments.map(a => a.employeeId).filter(Boolean))];
+        const [services, employees] = await Promise.all([
+          db.collection('SERVICES').find({ _id:{ $in:serviceIds } }).project({ name:1, price:1 }).toArray(),
+          db.collection('EMPLOYEES').find({ _id:{ $in:employeeIds } }).project({ name:1 }).toArray(),
+        ]);
+        const svcMap = Object.fromEntries(services.map(s => [s._id.toString(), s]));
+        const empMap = Object.fromEntries(employees.map(e => [e._id.toString(), e]));
+
+        const serviceHistory = appointments.map(a => ({
+          _id:            a._id,
+          date:           a.date,
+          time:           a.time,
+          status:         a.status,
+          paymentStatus:  a.paymentStatus,
+          totalPrice:     a.totalPrice,
+          employeeName:   empMap[a.employeeId?.toString()]?.name || null,
+          services:       (a.serviceIds || []).map(id => svcMap[id.toString()]?.name).filter(Boolean),
+        }));
+
+        const completedVisits = appointments.filter(a => a.status === 'completed' || a.paymentStatus === 'paid' || a.paymentStatus === 'deposit_paid').length;
+
+        res.status(200).json({
+          success: true,
+          data: {
+            user,
+            visitStats: {
+              loginCount:        user.loginCount || 0,
+              lastLoginAt:       user.lastLoginAt || null,
+              totalBookings:     appointments.length,
+              completedVisits,
+              lastVisit:         appointments[0]?.date || null,
+              memberSince:       user.createdAt || null,
+            },
+            serviceHistory,
+            orders,
+            loyalty: { ...loyaltyAccount, transactions: loyaltyTxns },
+            referrals: { successfulReferrals: referralsMade, referredBy: referredBy ? `${referredBy.firstName} ${referredBy.lastName}`.trim() : null },
+          },
+        });
+      } catch (err) { next(err); }
+    });
+
     app.put('/users/:id', authenticateToken, authorizeRole('admin'), idValidator,
       body('email').optional().isEmail().normalizeEmail(),
       body('firstName').optional().isString().notEmpty(),
       body('lastName').optional().isString().notEmpty(),
       body('role').optional().isIn(['user','admin']),
+      body('phone').optional().isString().isLength({ min: 9, max: 20 }),
       async (req, res, next) => {
         try {
           const errors = validationResult(req);
           if (!errors.isEmpty()) return sendValidationError(res, errors.array());
+          if (req.body.phone) req.body.phone = sanitiseText(req.body.phone, 20);
           delete req.body.password;
           req.body.updatedAt = new Date();
           const updatedUser = await db.collection('USERS').findOneAndUpdate({ _id:new ObjectId(req.params.id) }, { $set:req.body }, { returnDocument:'after', projection:{ password:0 } });
@@ -1824,7 +2000,16 @@ async function startServer() {
         if (!cardId?.match(/^[a-f\d]{24}$/i)) return res.status(400).json({ success: false, error: 'Invalid card ID' });
         const card = await db.collection('GIFT_CARDS').findOne({ _id: new ObjectId(cardId) });
         if (!card) return res.status(404).json({ success: false, error: 'Gift card not found' });
+        if (req.user?.role !== 'admin' && String(card.purchasedBy) !== String(req.user.userId)) {
+          return res.status(403).json({ success: false, error: 'You do not have permission to confirm this gift card' });
+        }
         if (card.status === 'active') return res.json({ success: true, data: card });
+
+        const { verified, status } = await verifyYocoCheckout(card.yocoCheckoutId);
+        if (!verified) {
+          logger.info('Gift card confirm: Yoco checkout not yet completed', { cardId, yocoStatus:status });
+          return res.json({ success: true, pending: true });
+        }
 
         await db.collection('GIFT_CARDS').updateOne({ _id: new ObjectId(cardId) }, { $set: { status: 'active', updatedAt: new Date() } });
 
@@ -2341,7 +2526,17 @@ async function startServer() {
         if (!orderId) return res.status(400).json({ success:false, error:'orderId is required' });
         const order = await db.collection('ORDERS').findOne({ _id:new ObjectId(orderId) });
         if (!order) return res.status(404).json({ success:false, error:'Order not found' });
+        if (req.user?.role !== 'admin' && String(order.userId) !== String(req.user.userId)) {
+          return res.status(403).json({ success:false, error:'You do not have permission to verify this order' });
+        }
         if (order.status === 'confirmed' && order.paymentStatus === 'paid') return res.json({ success:true, alreadyConfirmed:true, order });
+
+        const { verified, status } = await verifyYocoCheckout(order.yocoCheckoutId);
+        if (!verified) {
+          logger.info('Order verify: Yoco checkout not yet completed', { orderId, yocoStatus:status });
+          return res.json({ success:true, alreadyConfirmed:false, pending:true });
+        }
+
         await db.collection('ORDERS').updateOne({ _id:new ObjectId(orderId) }, { $set:{ status:'confirmed', paymentStatus:'paid', updatedAt:new Date() } });
         for (const item of order.items||[]) { await db.collection('PRODUCTS').updateOne({ _id:item.productId }, { $inc:{ stock:-item.quantity } }); }
 
@@ -3131,6 +3326,18 @@ ${urlEntries}
     });
     // ──────────────────────────────────────────────────────────────────────
 
+    // ── Manually trigger the 30-day rebooking reminder check — lets an admin
+    // verify the feature works (Resend key set, template renders, etc.)
+    // without waiting for the hourly cron to hit the right window.
+    app.post('/admin/send-rebooking-reminders', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        if (!process.env.RESEND_API_KEY) return res.status(400).json({ success:false, error:'RESEND_API_KEY is not configured — reminder emails are disabled.' });
+        await sendRebookingReminders();
+        res.json({ success:true, message:'Rebooking reminder check run — see server logs for how many were sent.' });
+      } catch (err) { next(err); }
+    });
+    // ──────────────────────────────────────────────────────────────────────
+
     // ══════════════════════════════════════════════════════════════════════
     // SUBSCRIPTION PACKAGES
     // ══════════════════════════════════════════════════════════════════════
@@ -3263,7 +3470,16 @@ ${urlEntries}
 
         const sub = await db.collection('SUBSCRIPTIONS').findOne({ _id: new ObjectId(subId) });
         if (!sub) return res.status(404).json({ success:false, error:'Subscription not found' });
+        if (req.user?.role !== 'admin' && String(sub.userId) !== String(req.user.userId)) {
+          return res.status(403).json({ success:false, error:'You do not have permission to confirm this subscription' });
+        }
         if (sub.status === 'active') return res.json({ success: true, data: sub }); // already confirmed
+
+        const { verified, status } = await verifyYocoCheckout(sub.yocoCheckoutId);
+        if (!verified) {
+          logger.info('Subscription confirm: Yoco checkout not yet completed', { subId, yocoStatus:status });
+          return res.json({ success:true, pending:true });
+        }
 
         const now = new Date();
         await db.collection('SUBSCRIPTIONS').updateOne(
@@ -4213,10 +4429,15 @@ ${urlEntries}
           if (!userId) {
             let existing = await db.collection('USERS').findOne({ email: email.toLowerCase() });
             if (!existing) {
-              const bcrypt = require('bcryptjs');
               const r2 = await db.collection('USERS').insertOne({ email: email.toLowerCase(), password: await bcrypt.hash(Math.random().toString(36), 10), firstName: sanitiseText(firstName, 50), lastName: sanitiseText(lastName, 50), phone: sanitiseText(phone, 20), role: 'user', isActive: true, isGuest: true, createdAt: new Date(), updatedAt: new Date() });
               userId = r2.insertedId;
             } else { userId = existing._id; }
+          }
+          // Keep the phone number on file up to date for SMS/WhatsApp reminders
+          // (covers the logged-in-user and existing-guest cases above, which
+          // otherwise never persisted the phone entered on this form).
+          if (phone && String(phone).replace(/\D/g, '').length >= 9) {
+            await db.collection('USERS').updateOne({ _id: userId }, { $set: { phone: sanitiseText(phone, 20), updatedAt: new Date() } });
           }
 
           const svcIds = serviceIds.map(id => new ObjectId(id));
@@ -4566,6 +4787,111 @@ ${urlEntries}
       }
     }
 
+    // ── Rebooking reminder cron — runs hourly, emails clients ~30 days after
+    // their last paid appointment nudging them to book again. Distinct from
+    // sendAppointmentReminders() above, which reminds clients the DAY BEFORE
+    // an upcoming appointment — this one is a post-visit win-back email.
+    async function sendRebookingReminders() {
+      if (!process.env.RESEND_API_KEY) return;
+      try {
+        const REBOOKING_REMINDER_DAYS = 30;
+        const windowStart = new Date();
+        windowStart.setDate(windowStart.getDate() - (REBOOKING_REMINDER_DAYS + 1));
+        const windowEnd = new Date();
+        windowEnd.setDate(windowEnd.getDate() - REBOOKING_REMINDER_DAYS);
+
+        const toISO = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        const startDate = toISO(windowStart);
+        const endDate   = toISO(windowEnd);
+
+        // A "real" past visit: paid (deposit or in full) and not cancelled.
+        // Not filtered on status:'completed' — that field is only ever set by
+        // an admin manually clicking "Complete" and can't be relied on to be
+        // populated for every past appointment.
+        const appointments = await db.collection('APPOINTMENTS').find({
+          date:                  { $gte: startDate, $lte: endDate },
+          status:                { $ne: 'cancelled' },
+          paymentStatus:         { $in: ['deposit_paid', 'paid'] },
+          rebookingReminderSent: { $ne: true },
+        }).toArray();
+
+        if (!appointments.length) return;
+
+        logger.info(`[REBOOK REMINDER] Found ${appointments.length} appointment(s) from ${startDate}–${endDate} to send a rebooking nudge for`);
+
+        const resend = new Resend(process.env.RESEND_API_KEY);
+        const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
+        let sentCount = 0, skippedCount = 0, errorCount = 0;
+
+        for (const appt of appointments) {
+          try {
+            const clientUser = await db.collection('USERS').findOne(
+              { _id: appt.userId },
+              { projection: { email:1, firstName:1 } }
+            );
+            if (!clientUser?.email) {
+              // Nothing to send to — mark it done so it's not re-checked every hour.
+              await db.collection('APPOINTMENTS').updateOne({ _id: appt._id }, { $set: { rebookingReminderSent: true, rebookingReminderSentAt: new Date() } });
+              skippedCount++;
+              continue;
+            }
+
+            const services  = await db.collection('SERVICES').find({ _id: { $in: appt.serviceIds || [] } }).project({ name:1 }).toArray();
+            const svcNames  = services.map(s => s.name).join(', ') || 'your last service';
+            const bookingLink = `${frontendUrl}/dashboard`;
+
+            const response = await resend.emails.send({
+              from:    'NXL Beauty Bar <onboarding@resend.dev>',
+              to:      clientUser.email,
+              subject: `✨ It's time for your ${svcNames} — book now!`,
+              html: `
+                <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
+                  <h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2>
+                  <h3 style="color:#6b3528;margin-top:0;">It's Time to Glow Again! ✨</h3>
+                  <p style="color:#555;line-height:1.65;">Hi ${clientUser.firstName || 'there'},</p>
+                  <p style="color:#555;line-height:1.65;">It's been about a month since your last visit — we hope your <strong>${svcNames}</strong> left you feeling fabulous! Regular maintenance keeps your look fresh, and we'd love to see you again.</p>
+                  <div style="background:#fff8f3;border:1px solid #e0ccc4;border-left:4px solid #c9a96e;border-radius:10px;padding:1rem 1.25rem;margin:1.25rem 0;">
+                    <p style="margin:0;font-weight:700;color:#3d1f15;">Why rebook now?</p>
+                    <ul style="margin:0.5rem 0 0;padding-left:1.25rem;font-size:0.85rem;color:#6b3528;line-height:1.8;">
+                      <li>Regular maintenance means better, longer-lasting results</li>
+                      <li>Quick, convenient online booking</li>
+                      <li>Earn loyalty points on every visit</li>
+                    </ul>
+                  </div>
+                  <div style="text-align:center;margin:1.5rem 0;">
+                    <a href="${bookingLink}" style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.875rem 2rem;border-radius:50px;font-weight:700;font-size:0.9rem;display:inline-block;">📅 Book Your Next Appointment</a>
+                  </div>
+                  <p style="color:#9e7060;font-size:0.8rem;line-height:1.65;">Questions? WhatsApp us at <a href="https://wa.me/27685113394" style="color:#a0502e;">068 511 3394</a>.</p>
+                  <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
+                  <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p>
+                </div>
+              `,
+            });
+
+            if (response.error) throw new Error(response.error.message);
+
+            await db.collection('APPOINTMENTS').updateOne(
+              { _id: appt._id },
+              { $set: { rebookingReminderSent: true, rebookingReminderSentAt: new Date() } }
+            );
+            logger.info(`[REBOOK REMINDER] Sent to ${clientUser.email} for appointment ${appt._id}`);
+            sentCount++;
+
+            // Gentle pacing — Resend's free tier is generous, but no need to
+            // hammer it in a tight loop for what's at most a handful of emails/hour.
+            await new Promise(r => setTimeout(r, 1000));
+          } catch (apptErr) {
+            logger.error(`[REBOOK REMINDER] Failed for appointment ${appt._id}: ${apptErr.message}`);
+            errorCount++;
+          }
+        }
+
+        logger.info(`[REBOOK REMINDER] Done — sent: ${sentCount}, skipped: ${skippedCount}, errors: ${errorCount}`);
+      } catch (err) {
+        logger.error(`[REBOOK REMINDER] Cron error: ${err.message}`);
+      }
+    }
+
     // ── Subscription renewal cron — runs daily ─────────────────────────────
     async function processSubscriptionRenewals() {
       try {
@@ -4623,6 +4949,12 @@ ${urlEntries}
     sendAppointmentReminders();
     setInterval(sendAppointmentReminders, 60 * 60 * 1000);
     logger.info('[REMINDER] 24-hour reminder cron scheduled (hourly)');
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Run once on startup then every hour
+    sendRebookingReminders();
+    setInterval(sendRebookingReminders, 60 * 60 * 1000);
+    logger.info('[REBOOK REMINDER] 30-day rebooking reminder cron scheduled (hourly)');
     // ─────────────────────────────────────────────────────────────────────
 
     if (process.env.NODE_ENV === 'production' && process.env.BACKEND_URL) {
