@@ -1027,6 +1027,9 @@ async function startServer() {
                 return res.status(400).json({ success:false, error:'The new time overlaps with an existing appointment.' });
               }
             }
+
+            const blocked = await db.collection('AVAILABILITY').findOne({ date:newDate, time:{ $in:editSlots }, $or:[{ employeeId:newEmployee },{ employeeId:'ALL' }] });
+            if (blocked) return res.status(400).json({ success:false, error:'One or more time slots are unavailable' });
           }
           // ─────────────────────────────────────────────────────────────
           if (req.body.paymentStatus) {
@@ -1677,18 +1680,80 @@ async function startServer() {
       });
     });
 
-    app.post('/appointments/check-availability', authenticateToken, async (req, res) => {
+   // REPLACE WITH:
+app.post('/appointments/check-availability', authenticateToken, async (req, res) => {
+  try {
+    const { date, time, employeeId, appointmentId, serviceIds } = req.body;
+    if (!date || !time) {
+      return res.status(400).json({ success: false, error: 'date and time are required' });
+    }
+
+    const time24 = normalizeTimeTo24h(time) || time;
+
+    // Generate all slots this appointment will occupy based on service durations
+    let slotsToCheck = [time24];
+    if (serviceIds && serviceIds.length > 0) {
       try {
-        const { date, time, employeeId, appointmentId } = req.body;
-        if (!date || !time) return res.status(400).json({ success:false, error:'date and time are required' });
-        const query = { date, status:{ $nin:['cancelled','pending'] }, paymentStatus:{ $in:['deposit_paid','paid'] } };
-        if (employeeId) { try { query.employeeId = new ObjectId(employeeId); } catch {} }
-        if (appointmentId) { try { query._id = { $ne: new ObjectId(appointmentId) }; } catch {} }
-        query.time = normalizeTimeTo24h(time) || time;
-        const existing = await db.collection('APPOINTMENTS').findOne(query);
-        return res.json({ success:true, available:!existing, message:existing ? 'This time slot has been taken by another client.' : 'Available' });
-      } catch (err) { res.status(500).json({ success:false, error:'Server error' }); }
-    });
+        const svcObjectIds = serviceIds.map(id => new ObjectId(id));
+        const services = await db.collection('SERVICES').find({ _id: { $in: svcObjectIds } }).toArray();
+        const totalDuration = services.reduce((sum, s) => sum + (s.durationMinutes || 15), 0);
+        slotsToCheck = generateSlotRange(time24, totalDuration);
+      } catch {}
+    }
+
+    // ── Check 1: Admin-blocked slots ────────────────────────────────────
+    let empObjectId = null;
+    if (employeeId) {
+      try { empObjectId = new ObjectId(employeeId); } catch {}
+    }
+
+    const blockedQuery = {
+      date,
+      time: { $in: slotsToCheck },
+      ...(empObjectId
+        ? { $or: [{ employeeId: empObjectId }, { employeeId: 'ALL' }] }
+        : { employeeId: 'ALL' }),
+    };
+
+    const blocked = await db.collection('AVAILABILITY').findOne(blockedQuery);
+    if (blocked) {
+      return res.json({
+        success: true,
+        available: false,
+        reason: 'blocked',
+        message: 'This time slot has been blocked by the salon. Please choose a different time.',
+      });
+    }
+
+    // ── Check 2: Existing booked appointments ───────────────────────────
+    const apptQuery = {
+      date,
+      time: { $in: slotsToCheck },
+      status: { $nin: ['cancelled', 'pending'] },
+      paymentStatus: { $in: ['deposit_paid', 'paid'] },
+    };
+    if (empObjectId) apptQuery.employeeId = empObjectId;
+    if (appointmentId) {
+      try { apptQuery._id = { $ne: new ObjectId(appointmentId) }; } catch {}
+    }
+
+    const overlapping = await db.collection('APPOINTMENTS').findOne(apptQuery);
+    if (overlapping) {
+      return res.json({
+        success: true,
+        available: false,
+        reason: 'booked',
+        message: 'This time slot has been taken by another client. Please choose a different time.',
+      });
+    }
+
+    return res.json({ success: true, available: true, message: 'Available' });
+
+  } catch (err) {
+    logger.error('check-availability error:', err);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
 
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
