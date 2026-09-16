@@ -26,15 +26,7 @@ function pad2(n) { return String(n).padStart(2, '0'); }
 // ── Sanitise free-text to prevent XSS / injection ─────────────────────────
 // Strips HTML tags and trims whitespace. Applied to all user-supplied text
 // that is stored in DB and potentially rendered back to clients.
-function sanitiseText(val, maxLen = 1000) {
-  if (typeof val !== 'string') return '';
-  return val
-    .replace(/<[^>]*>/g, '')        // strip HTML tags
-    .replace(/javascript:/gi, '')   // strip JS protocol
-    .replace(/on\w+\s*=/gi, '')     // strip inline event handlers
-    .trim()
-    .slice(0, maxLen);
-}
+const sanitiseText = require('./lib/sanitise');
 // ─────────────────────────────────────────────────────────────────────────
 
 function normalizeTimeTo24h(timeRaw) {
