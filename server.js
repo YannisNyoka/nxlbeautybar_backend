@@ -137,32 +137,7 @@ app.use((req, res, next) => {
   }
 });
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { success: false, error: 'Too many requests, please try again later.' }
-});
-
-// Stricter limiter for payment creation (prevent payment flooding)
-const paymentLimiter = rateLimit({
-  windowMs: 60 * 1000,   // 1 minute
-  max: 5,
-  message: { success: false, error: 'Too many payment requests. Please wait a moment.' }
-});
-
-// Order creation limiter
-const orderLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  message: { success: false, error: 'Too many order requests. Please wait a moment.' }
-});
-
-// Discount code validation limiter (prevent brute-force guessing)
-const discountLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  message: { success: false, error: 'Too many discount code attempts. Please try again later.' }
-});
+const { authLimiter, paymentLimiter, orderLimiter, discountLimiter } = require('./lib/rateLimiters');
 
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.DB_NAME;
