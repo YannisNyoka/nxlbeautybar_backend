@@ -102,11 +102,7 @@ const corsOptions = {
 
 const logger = require('./lib/logger');
 
-function sendValidationError(res, errors) {
-  const list = Array.isArray(errors) ? errors : [];
-  const msg = list.length ? list.map(e => `${e?.path || e?.param || 'field'}: ${e?.msg || 'Invalid value'}`).join(', ') : 'Validation failed';
-  return res.status(400).json({ success: false, error: msg, errors: list });
-}
+const { sendValidationError, idValidator } = require('./lib/validation');
 
 const decimalToNumber = require('./lib/decimal');
 
@@ -213,8 +209,6 @@ async function startServer() {
         next();
       };
     }
-
-    const idValidator = param('id').isMongoId().withMessage('Invalid ID format');
 
     // =====================
     // AUTH ROUTES
