@@ -1132,20 +1132,7 @@ async function startServer() {
     // ── Server-to-server confirmation that a Yoco checkout actually succeeded.
     // Every "verify"/"confirm" endpoint below must call this before flipping a
     // record to paid/active — never trust the client's say-so alone.
-    async function verifyYocoCheckout(checkoutId) {
-      if (!checkoutId) return { verified:false, status:'no_checkout_id' };
-      try {
-        const resp = await fetchFn(`https://payments.yoco.com/api/checkouts/${checkoutId}`, {
-          headers: { 'Authorization': `Bearer ${process.env.YOCO_SECRET_KEY}` },
-        });
-        if (!resp.ok) { logger.error('Yoco checkout lookup failed', { checkoutId, status:resp.status }); return { verified:false, status:'lookup_failed' }; }
-        const data = await resp.json();
-        return { verified: data.status === 'completed', status: data.status };
-      } catch (err) {
-        logger.error('Yoco checkout verification error', { checkoutId, error:err.message });
-        return { verified:false, status:'error' };
-      }
-    }
+    const { verifyYocoCheckout } = require('./lib/yoco');
 
     // ── Side effects that must fire exactly once when a booking deposit is
     // first confirmed paid — called from both /payments/verify and the Yoco
@@ -4068,45 +4055,7 @@ ${urlEntries}
     // Falls back to logging a wa.me link so admin can send manually.
     // ══════════════════════════════════════════════════════════════════════
 
-    async function sendSMS(phone, message) {
-      const cleaned = phone.replace(/\D/g, '');
-      // Normalise to E.164 South African format
-      const e164 = cleaned.startsWith('27') ? `+${cleaned}`
-        : cleaned.startsWith('0') ? `+27${cleaned.slice(1)}`
-        : `+${cleaned}`;
-
-      if (process.env.AT_API_KEY && process.env.AT_USERNAME) {
-        try {
-          const params = new URLSearchParams({
-            username: process.env.AT_USERNAME,
-            to:       e164,
-            message,
-            from:     process.env.AT_SENDER_ID || 'NXLBeauty',
-          });
-          const resp = await fetchFn('https://api.africastalking.com/version1/messaging', {
-            method:  'POST',
-            headers: {
-              'apiKey':       process.env.AT_API_KEY,
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'Accept':       'application/json',
-            },
-            body: params.toString(),
-          });
-          const data = await resp.json();
-          const status = data?.SMSMessageData?.Recipients?.[0]?.status;
-          logger.info(`[SMS] Sent to ${e164}: ${status}`);
-          return { sent: true, status, provider: 'africastalking' };
-        } catch (smsErr) {
-          logger.error(`[SMS] Africa's Talking failed: ${smsErr.message}`);
-        }
-      }
-
-      // Fallback — log WhatsApp link
-      const waText = encodeURIComponent(message);
-      const waUrl  = `https://wa.me/${e164.replace('+','')}?text=${waText}`;
-      logger.info(`[SMS FALLBACK] No AT credentials — wa.me link: ${waUrl}`);
-      return { sent: false, waUrl, provider: 'fallback' };
-    }
+    const sendSMS = require('./lib/sms');
 
     // POST /sms/send — admin manually sends SMS to a client
     app.post('/sms/send', authenticateToken, authorizeRole('admin'),
