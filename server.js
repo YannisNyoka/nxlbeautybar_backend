@@ -1806,6 +1806,65 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
   }
 });
 
+    // ── Public GET routes ────────────────────────────────────────────────
+    // These must be registered BEFORE crudRoutes() below: crudRoutes wires
+    // up `GET /<collection>/:id` (authenticateToken-gated) for each of
+    // APPOINTMENTS/AVAILABILITY/EMPLOYEES/SERVICES, and Express matches
+    // routes in registration order. A route added after crudRoutes() with
+    // a literal path shaped like `/<collection>/<word>` — e.g.
+    // `/employees/public` or `/availability/slots` — would be shadowed by
+    // the earlier `/<collection>/:id` route (":id" happily matches "public"
+    // or "slots") and incorrectly require a token before ever running.
+
+    // ── GET /services/public ───────────────────────────────────────────────
+    app.get('/services/public', async (req, res, next) => {
+      try {
+        const svcs = await db.collection('SERVICES').find({ isActive: true }).toArray();
+        res.json({ success: true, data: svcs.map(s => ({ ...s, price: parseFloat(s.price?.toString() || 0) })) });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /employees/public ──────────────────────────────────────────────
+    app.get('/employees/public', async (req, res, next) => {
+      try {
+        const staff = await db.collection('EMPLOYEES').find({ isActive: true }).project({ name:1, role:1, bio:1 }).toArray();
+        res.json({ success: true, data: staff });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /availability/slots ────────────────────────────────────────────
+    app.get('/availability/slots', async (req, res, next) => {
+      try {
+        const { date, employeeId } = req.query;
+        if (!date || !employeeId) return res.status(400).json({ success: false, error: 'date and employeeId are required' });
+        if (employeeId !== 'any') {
+          try { new ObjectId(employeeId); }
+          catch { return res.status(400).json({ success: false, error: 'Invalid employeeId' }); }
+        }
+        const map = await getOccupiedSlotsMap(db, date, date, employeeId);
+        res.json({ success: true, data: map[date] || [] });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /availability/month — occupied slots for a date range ──────────
+    // Public (no auth) and PII-free by design: it's the only way the
+    // logged-in dashboard booking widget can tell which slots OTHER
+    // customers have taken, since GET /appointments deliberately restricts
+    // non-admins to their own bookings only.
+    app.get('/availability/month', async (req, res, next) => {
+      try {
+        const { start, end, employeeId } = req.query;
+        if (!start || !end || !employeeId) return res.status(400).json({ success: false, error: 'start, end and employeeId are required' });
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return res.status(400).json({ success: false, error: 'start and end must be YYYY-MM-DD' });
+        if (employeeId !== 'any') {
+          try { new ObjectId(employeeId); }
+          catch { return res.status(400).json({ success: false, error: 'Invalid employeeId' }); }
+        }
+        const map = await getOccupiedSlotsMap(db, start, end, employeeId);
+        res.json({ success: true, data: map });
+      } catch (err) { next(err); }
+    });
+
     crudRoutes('APPOINTMENTS', 'appointments');
     crudRoutes('AVAILABILITY', 'availability');
     crudRoutes('EMPLOYEES', 'employees');
@@ -4490,55 +4549,6 @@ ${urlEntries}
     // ══════════════════════════════════════════════════════════════════════
 
     // ── POST /discount-codes/validate
-
-    // ── GET /services/public ───────────────────────────────────────────────
-    app.get('/services/public', async (req, res, next) => {
-      try {
-        const svcs = await db.collection('SERVICES').find({ isActive: true }).toArray();
-        res.json({ success: true, data: svcs.map(s => ({ ...s, price: parseFloat(s.price?.toString() || 0) })) });
-      } catch (err) { next(err); }
-    });
-
-    // ── GET /employees/public ──────────────────────────────────────────────
-    app.get('/employees/public', async (req, res, next) => {
-      try {
-        const staff = await db.collection('EMPLOYEES').find({ isActive: true }).project({ name:1, role:1, bio:1 }).toArray();
-        res.json({ success: true, data: staff });
-      } catch (err) { next(err); }
-    });
-
-    // ── GET /availability/slots ────────────────────────────────────────────
-    app.get('/availability/slots', async (req, res, next) => {
-      try {
-        const { date, employeeId } = req.query;
-        if (!date || !employeeId) return res.status(400).json({ success: false, error: 'date and employeeId are required' });
-        if (employeeId !== 'any') {
-          try { new ObjectId(employeeId); }
-          catch { return res.status(400).json({ success: false, error: 'Invalid employeeId' }); }
-        }
-        const map = await getOccupiedSlotsMap(db, date, date, employeeId);
-        res.json({ success: true, data: map[date] || [] });
-      } catch (err) { next(err); }
-    });
-
-    // ── GET /availability/month — occupied slots for a date range ──────────
-    // Public (no auth) and PII-free by design: it's the only way the
-    // logged-in dashboard booking widget can tell which slots OTHER
-    // customers have taken, since GET /appointments deliberately restricts
-    // non-admins to their own bookings only.
-    app.get('/availability/month', async (req, res, next) => {
-      try {
-        const { start, end, employeeId } = req.query;
-        if (!start || !end || !employeeId) return res.status(400).json({ success: false, error: 'start, end and employeeId are required' });
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return res.status(400).json({ success: false, error: 'start and end must be YYYY-MM-DD' });
-        if (employeeId !== 'any') {
-          try { new ObjectId(employeeId); }
-          catch { return res.status(400).json({ success: false, error: 'Invalid employeeId' }); }
-        }
-        const map = await getOccupiedSlotsMap(db, start, end, employeeId);
-        res.json({ success: true, data: map });
-      } catch (err) { next(err); }
-    });
 
     // ── POST /appointments/guest — book without login ──────────────────────
     app.post('/appointments/guest',
