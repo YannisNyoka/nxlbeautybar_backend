@@ -4461,12 +4461,42 @@ ${urlEntries}
       try {
         const { date, employeeId } = req.query;
         if (!date || !employeeId) return res.status(400).json({ success: false, error: 'date and employeeId are required' });
-        const empQuery = employeeId === 'any' ? {} : { employeeId: new ObjectId(employeeId) };
-        const blocked  = await db.collection('AVAILABILITY').find({ date, ...empQuery }).project({ time:1 }).toArray();
-        const booked   = await db.collection('APPOINTMENTS').find({
-          date, ...empQuery, status: { $in: ['booked', 'pending'] },
-        }).project({ time:1 }).toArray();
-        const taken = [...new Set([...blocked.map(b => b.time), ...booked.map(b => b.time)])];
+        const isAny = employeeId === 'any';
+        let empObjectId = null;
+        if (!isAny) {
+          try { empObjectId = new ObjectId(employeeId); }
+          catch { return res.status(400).json({ success: false, error: 'Invalid employeeId' }); }
+        }
+
+        const blockedQuery = isAny ? { date } : { date, $or: [{ employeeId: empObjectId }, { employeeId: 'ALL' }] };
+        const blocked = await db.collection('AVAILABILITY').find(blockedQuery).project({ time:1 }).toArray();
+
+        const apptQuery = { date, status: { $in: ['booked', 'pending'] }, ...(isAny ? {} : { employeeId: empObjectId }) };
+        const bookedAppts = await db.collection('APPOINTMENTS').find(apptQuery).project({ time:1, occupiedSlots:1, serviceIds:1 }).toArray();
+
+        // Expand each appointment to every slot it occupies. Bookings made
+        // through the staff/admin flow store `occupiedSlots`; guest bookings
+        // don't, so fall back to deriving the range from service durations —
+        // otherwise a multi-slot appointment (e.g. a 45-min service spanning
+        // two 30-min slots) only shows its start time as taken.
+        const needDurationIds = [...new Set(
+          bookedAppts.filter(a => !(Array.isArray(a.occupiedSlots) && a.occupiedSlots.length))
+                     .flatMap(a => a.serviceIds || []).map(String)
+        )];
+        const svcMap = needDurationIds.length
+          ? Object.fromEntries((await db.collection('SERVICES')
+              .find({ _id: { $in: needDurationIds.map(id => new ObjectId(id)) } })
+              .project({ durationMinutes:1 }).toArray())
+              .map(s => [String(s._id), s.durationMinutes]))
+          : {};
+
+        const bookedTimes = bookedAppts.flatMap(a => {
+          if (Array.isArray(a.occupiedSlots) && a.occupiedSlots.length) return a.occupiedSlots;
+          const totalDuration = (a.serviceIds || []).reduce((sum, id) => sum + (svcMap[String(id)] || 30), 0);
+          return generateSlotRange(a.time, totalDuration || 30);
+        });
+
+        const taken = [...new Set([...blocked.map(b => b.time), ...bookedTimes])];
         res.json({ success: true, data: taken });
       } catch (err) { next(err); }
     });
