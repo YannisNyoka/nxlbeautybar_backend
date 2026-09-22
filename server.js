@@ -939,7 +939,17 @@ async function startServer() {
             const user = await db.collection('USERS').findOne({ _id:doc.userId }, { projection:{ password:0 } });
             const employee = await db.collection('EMPLOYEES').findOne({ _id:doc.employeeId });
             const services = await db.collection('SERVICES').find({ _id:{ $in:doc.serviceIds } }).toArray();
-            doc = { ...doc, user, employee, services };
+            // Actual amount paid for the deposit, not just today's env config —
+            // a payment made months ago should still show what was really
+            // charged at the time, even if DEPOSIT_AMOUNT has since changed.
+            const depositPayment = await db.collection('PAYMENTS').findOne(
+              { appointmentId: doc._id, type: 'deposit', status: 'paid' },
+              { sort: { createdAt: -1 } }
+            );
+            const depositAmount = depositPayment
+              ? parseFloat(depositPayment.amount?.toString() || 0)
+              : Number(process.env.DEPOSIT_AMOUNT || 100);
+            doc = { ...doc, user, employee, services, depositAmount };
           }
           res.status(200).json({ success:true, data:doc });
         } catch (err) { next(err); }
@@ -2481,11 +2491,17 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
           return res.status(403).json({ success:false, error:'Email does not match booking' });
 
         const svcIds = appt.serviceIds || [];
-        const [services, employee] = await Promise.all([
+        const [services, employee, depositPayment] = await Promise.all([
           db.collection('SERVICES').find({ _id:{ $in:svcIds } }).project({ name:1, durationMinutes:1 }).toArray(),
           appt.employeeId ? db.collection('EMPLOYEES').findOne({ _id:appt.employeeId }, { projection:{ name:1 } }) : null,
+          db.collection('PAYMENTS').findOne({ appointmentId: appt._id, type: 'deposit', status: 'paid' }, { sort: { createdAt: -1 } }),
         ]);
         const totalDuration = services.reduce((sum, s) => sum + (s.durationMinutes || 30), 0);
+        // Actual amount paid, not just today's env config — see the matching
+        // comment on GET /appointments/:id for why.
+        const depositAmount = depositPayment
+          ? parseFloat(depositPayment.amount?.toString() || 0)
+          : Number(process.env.DEPOSIT_AMOUNT || 100);
 
         res.json({ success:true, data: {
           name:                 `${user.firstName} ${user.lastName}`.trim(),
@@ -2497,6 +2513,7 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
           totalPrice:           parseFloat(appt.totalPrice?.toString() || 0),
           totalDuration:        totalDuration || 60,
           paymentStatus:        appt.paymentStatus,
+          depositAmount,
           loyaltyPointsRedeemed:  appt.loyaltyPointsRedeemed || 0,
           loyaltyBalanceDiscount: parseFloat(appt.loyaltyBalanceDiscount?.toString() || 0),
           discountCode:           appt.discountCode || null,
