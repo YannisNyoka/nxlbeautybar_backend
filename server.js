@@ -25,6 +25,7 @@ const sanitiseText = require('./lib/sanitise');
 // ─────────────────────────────────────────────────────────────────────────
 
 const getOccupiedSlotsMap = require('./lib/availability');
+const { getSalonSettings, getDayKey, getHoursForDate } = require('./lib/salonSettings');
 
 const app = express();
 const port = process.env.PORT;
@@ -421,7 +422,7 @@ async function startServer() {
         validators = [
           body('date').custom((v, { req }) => { const n = normalizeAppointmentDateTime(v, req.body?.time); if (!n) return false; req.body.date = n.date; req.body.time = n.time; return true; }),
           body('time').custom((v, { req }) => { const n = normalizeAppointmentDateTime(req.body?.date, v); if (!n) return false; req.body.date = n.date; req.body.time = n.time; return true; }),
-          body('employeeId').isMongoId(), body('serviceIds').isArray({ min:1 }), body('serviceIds.*').isMongoId()
+          body('employeeId').custom(v => v === 'any' || /^[a-f\d]{24}$/i.test(v)), body('serviceIds').isArray({ min:1 }), body('serviceIds.*').isMongoId()
         ];
       } else if (collectionName === 'PAYMENTS') {
         validators = [body('appointmentId').isMongoId(), body('type').optional().isIn(['deposit','full']), body('amount').isDecimal({ decimal_digits:'0,2' }).custom(v => parseFloat(v) > 0), body('method').isIn(['cash','card','online']), body('status').isIn(['pending','paid','refunded'])];
@@ -457,6 +458,15 @@ async function startServer() {
         delete req.body.createdAt; delete req.body.updatedAt;
         if (collectionName === 'USERS') delete req.body.role;
         req.body.createdAt = new Date(); req.body.updatedAt = new Date();
+        if (collectionName === 'APPOINTMENTS' && req.body.employeeId === 'any') {
+          // "Any available" staff — resolve to a concrete employee the same
+          // way POST /appointments/guest already does. The overlap check
+          // below still protects against double-booking even if this picks
+          // someone who turns out to be busy for the requested slot.
+          const avail = await db.collection('EMPLOYEES').findOne({ isActive: true });
+          if (!avail) return res.status(400).json({ success:false, error:'No staff available.' });
+          req.body.employeeId = avail._id;
+        }
         if (req.body.employeeId && typeof req.body.employeeId === 'string' && req.body.employeeId !== 'ALL') req.body.employeeId = new ObjectId(req.body.employeeId);
         if (Array.isArray(req.body.serviceIds)) req.body.serviceIds = req.body.serviceIds.map(id => new ObjectId(id));
         if (Array.isArray(req.body.servicesOffered)) req.body.servicesOffered = req.body.servicesOffered.map(id => new ObjectId(id));
@@ -480,16 +490,28 @@ async function startServer() {
           const totalDuration = services.reduce((sum, s) => sum + s.durationMinutes, 0);
           const requestedSlots = generateSlotRange(req.body.time, totalDuration);
 
-          // ── 6 PM CUTOFF VALIDATION ───────────────────────────────────────
-          // Appointments can reach 6 PM (18:00) but cannot extend beyond it
+          // ── SALON HOURS VALIDATION ─────────────────────────────────────────
+          // Reject bookings on closed days or outside real operating hours,
+          // driven by SALON_SETTINGS rather than a hardcoded cutoff.
+          const salonSettings = await getSalonSettings(db);
+          const dayHours = getHoursForDate(salonSettings.weeklyHours, req.body.date);
+          if (dayHours.closed) {
+            return res.status(400).json({
+              success: false,
+              error: `NXL Beauty Bar is closed on this day. Please choose a different date.`,
+            });
+          }
           if (requestedSlots.length > 0) {
+            const firstSlot = requestedSlots[0];
             const lastSlot = requestedSlots[requestedSlots.length - 1];
             const [lastHour, lastMin] = lastSlot.split(':').map(Number);
-            // Block if last slot is after 18:00 (extends past 6 PM)
-            if (lastHour > 18 || (lastHour === 18 && lastMin > 0)) {
+            const [closeHour, closeMin] = dayHours.close.split(':').map(Number);
+            const startsBeforeOpen = firstSlot < dayHours.open;
+            const endsAfterClose   = lastHour > closeHour || (lastHour === closeHour && lastMin > closeMin);
+            if (startsBeforeOpen || endsAfterClose) {
               return res.status(400).json({
                 success: false,
-                error: `This appointment would end at ${lastSlot}, which is past our 6 PM closing time. Please contact NXL Beauty Bar at 068 511 3394 or WhatsApp us for special arrangements.`,
+                error: `This appointment falls outside our operating hours (${dayHours.open}–${dayHours.close}) on this day. Please contact NXL Beauty Bar at 068 511 3394 or WhatsApp us for special arrangements.`,
               });
             }
           }
@@ -738,14 +760,23 @@ async function startServer() {
             const editDuration = editServices.reduce((sum, s) => sum + (s.durationMinutes || 30), 0);
             const editSlots    = generateSlotRange(newTime, editDuration);
 
-            // ── 6 PM CUTOFF VALIDATION (on edit) ───────────────────────────
+            // ── SALON HOURS VALIDATION (on edit) ────────────────────────────
+            const editSalonSettings = await getSalonSettings(db);
+            const editDayHours = getHoursForDate(editSalonSettings.weeklyHours, newDate);
+            if (editDayHours.closed) {
+              return res.status(400).json({ success: false, error: `NXL Beauty Bar is closed on this day. Please choose a different date.` });
+            }
             if (editSlots.length > 0) {
+              const firstEditSlot = editSlots[0];
               const lastSlot = editSlots[editSlots.length - 1];
               const [lastHour, lastMin] = lastSlot.split(':').map(Number);
-              if (lastHour > 18 || (lastHour === 18 && lastMin > 0)) {
+              const [editCloseHour, editCloseMin] = editDayHours.close.split(':').map(Number);
+              const startsBeforeOpen = firstEditSlot < editDayHours.open;
+              const endsAfterClose   = lastHour > editCloseHour || (lastHour === editCloseHour && lastMin > editCloseMin);
+              if (startsBeforeOpen || endsAfterClose) {
                 return res.status(400).json({
                   success: false,
-                  error: `This appointment would end at ${lastSlot}, which is past our 6 PM closing time. Please contact NXL Beauty Bar at 068 511 3394 or WhatsApp us for special arrangements.`,
+                  error: `This appointment falls outside our operating hours (${editDayHours.open}–${editDayHours.close}) on this day. Please contact NXL Beauty Bar at 068 511 3394 or WhatsApp us for special arrangements.`,
                 });
               }
             }
@@ -1547,6 +1578,35 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
         }
         const map = await getOccupiedSlotsMap(db, start, end, employeeId);
         res.json({ success: true, data: map });
+      } catch (err) { next(err); }
+    });
+
+    // ── GET /salon-settings — weekly operating hours / closed days ─────────
+    // Public (no auth) — the booking flow needs this before a customer logs
+    // in. Read-only summary data, no PII.
+    app.get('/salon-settings', async (req, res, next) => {
+      try {
+        const settings = await getSalonSettings(db);
+        res.json({ success: true, data: { weeklyHours: settings.weeklyHours } });
+      } catch (err) { next(err); }
+    });
+
+    // ── PUT /salon-settings — admin: edit weekly operating hours ───────────
+    app.put('/salon-settings', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+      try {
+        const { weeklyHours } = req.body;
+        if (!weeklyHours || typeof weeklyHours !== 'object') return res.status(400).json({ success:false, error:'weeklyHours is required' });
+        const dayKeys = ['sun','mon','tue','wed','thu','fri','sat'];
+        for (const day of dayKeys) {
+          const entry = weeklyHours[day];
+          if (!entry || typeof entry !== 'object') return res.status(400).json({ success:false, error:`weeklyHours.${day} is required` });
+          if (typeof entry.closed !== 'boolean') return res.status(400).json({ success:false, error:`weeklyHours.${day}.closed must be a boolean` });
+          if (!/^\d{2}:\d{2}$/.test(entry.open) || !/^\d{2}:\d{2}$/.test(entry.close)) return res.status(400).json({ success:false, error:`weeklyHours.${day} open/close must be HH:MM` });
+          if (entry.open >= entry.close) return res.status(400).json({ success:false, error:`weeklyHours.${day}: open time must be before close time` });
+        }
+        const clean = Object.fromEntries(dayKeys.map(day => [day, { open: weeklyHours[day].open, close: weeklyHours[day].close, closed: weeklyHours[day].closed }]));
+        await db.collection('SALON_SETTINGS').updateOne({}, { $set: { weeklyHours: clean, updatedAt: new Date() } }, { upsert: true });
+        res.json({ success:true, data: { weeklyHours: clean } });
       } catch (err) { next(err); }
     });
 
@@ -4119,6 +4179,30 @@ ${urlEntries}
           const svcIds = serviceIds.map(id => new ObjectId(id));
           const svcs   = await db.collection('SERVICES').find({ _id: { $in: svcIds }, isActive: true }).toArray();
           if (svcs.length !== svcIds.length) return res.status(400).json({ success: false, error: 'One or more services not found.' });
+
+          // ── SALON HOURS VALIDATION ─────────────────────────────────────────
+          const guestTotalDuration = svcs.reduce((sum, sv) => sum + (sv.durationMinutes || 30), 0);
+          const guestRequestedSlots = generateSlotRange(time, guestTotalDuration);
+          const guestSalonSettings = await getSalonSettings(db);
+          const guestDayHours = getHoursForDate(guestSalonSettings.weeklyHours, date);
+          if (guestDayHours.closed) {
+            return res.status(400).json({ success: false, error: `NXL Beauty Bar is closed on this day. Please choose a different date.` });
+          }
+          if (guestRequestedSlots.length > 0) {
+            const firstSlot = guestRequestedSlots[0];
+            const lastSlot = guestRequestedSlots[guestRequestedSlots.length - 1];
+            const [lastHour, lastMin] = lastSlot.split(':').map(Number);
+            const [closeHour, closeMin] = guestDayHours.close.split(':').map(Number);
+            const startsBeforeOpen = firstSlot < guestDayHours.open;
+            const endsAfterClose   = lastHour > closeHour || (lastHour === closeHour && lastMin > closeMin);
+            if (startsBeforeOpen || endsAfterClose) {
+              return res.status(400).json({
+                success: false,
+                error: `This appointment falls outside our operating hours (${guestDayHours.open}–${guestDayHours.close}) on this day. Please contact NXL Beauty Bar at 068 511 3394 or WhatsApp us for special arrangements.`,
+              });
+            }
+          }
+          // ──────────────────────────────────────────────────────────────────
 
           let empId;
           if (!employeeId || employeeId === 'any') {

@@ -62,6 +62,9 @@ const initCollections = async (db) => {
   await db.createCollection('SUBSCRIPTION_PLANS', {}).catch(() => {});
   await db.collection('SUBSCRIPTION_PLANS').createIndex({ isActive: 1 });
 
+  // SALON_SETTINGS — singleton document: weekly operating hours / closed days
+  await db.createCollection('SALON_SETTINGS', {}).catch(() => {});
+
   // FEEDBACK — post-visit NPS surveys
   await db.createCollection('FEEDBACK', {}).catch(() => {});
   await db.collection('FEEDBACK').createIndex({ userId: 1 });
