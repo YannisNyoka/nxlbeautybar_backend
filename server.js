@@ -26,6 +26,7 @@ const sanitiseText = require('./lib/sanitise');
 
 const getOccupiedSlotsMap = require('./lib/availability');
 const { getSalonSettings, getDayKey, getHoursForDate } = require('./lib/salonSettings');
+const { initWhatsApp, sendWhatsAppMessage } = require('./lib/whatsapp');
 
 const app = express();
 const port = process.env.PORT;
@@ -1181,6 +1182,7 @@ async function startServer() {
         const svcNames = svcs.map(s => s.name).join(', ');
         if (client?.phone) {
           await sendSMS(client.phone, `NXL Beauty Bar: Payment confirmed! Your appointment for ${svcNames} on ${appt.date} at ${appt.time} is booked. See you soon! 💅`);
+          await sendWhatsAppMessage(client.phone, `✅ *Booking Confirmed* — NXL Beauty Bar\n\nHi ${client.firstName || ''}, your appointment is booked:\n📅 ${appt.date} at ${appt.time}\n💅 ${svcNames}\n\nSee you soon! 1948 Mahalefele Rd, Dube, Soweto.`);
         }
         await notifyClient(appt.userId, {
           type:  'booking_confirmed',
@@ -4517,24 +4519,31 @@ ${urlEntries}
             }
             // ─────────────────────────────────────────────────────────────
 
-            // ── WhatsApp reminder (via wa.me deep link stored as notification) ──
-            // If the user has a phone number, log a WhatsApp-ready notification
-            // so admin can see & tap to send. Full automation requires Meta Business API.
+            // ── WhatsApp reminder (automated via Baileys) ───────────────────────
             if (clientUser.phone) {
-              const waText = encodeURIComponent(
-                `Hi ${clientUser.firstName}! 👋 This is a reminder from NXL Beauty Bar. You have an appointment tomorrow, ${tomorrowISO} at ${appt.time}. ` +
-                `📍 1948 Mahalefele Rd, Dube, Soweto. Please arrive 5 mins early. See you soon! 💅`
-              );
-              const waUrl = `https://wa.me/${clientUser.phone.replace(/\D/g, '')}?text=${waText}`;
-              await db.collection('NOTIFICATIONS').insertOne({
-                type:    'whatsapp_reminder',
-                message: `WhatsApp reminder ready for ${clientUser.firstName} ${clientUser.lastName} (${appt.date} ${appt.time})`,
-                waUrl,
-                phone:   clientUser.phone,
-                read:    false,
-                target:  'staff',
-                createdAt: new Date(),
-              });
+              try {
+                const waResult = await sendWhatsAppMessage(clientUser.phone,
+                  `⏰ *Reminder* — NXL Beauty Bar\n\nHi ${clientUser.firstName}! You have an appointment tomorrow, ${tomorrowISO} at ${appt.time}.\n💅 ${svcNames}\n📍 1948 Mahalefele Rd, Dube, Soweto. Please arrive 5 mins early. See you soon!`
+                );
+                // Falls back to a staff-facing "tap to send" notification only
+                // when WhatsApp isn't connected (e.g. not yet linked, or down).
+                if (!waResult.sent) {
+                  const waText = encodeURIComponent(
+                    `Hi ${clientUser.firstName}! 👋 This is a reminder from NXL Beauty Bar. You have an appointment tomorrow, ${tomorrowISO} at ${appt.time}. ` +
+                    `📍 1948 Mahalefele Rd, Dube, Soweto. Please arrive 5 mins early. See you soon! 💅`
+                  );
+                  const waUrl = `https://wa.me/${clientUser.phone.replace(/\D/g, '')}?text=${waText}`;
+                  await db.collection('NOTIFICATIONS').insertOne({
+                    type:    'whatsapp_reminder',
+                    message: `WhatsApp reminder ready for ${clientUser.firstName} ${clientUser.lastName} (${appt.date} ${appt.time})`,
+                    waUrl,
+                    phone:   clientUser.phone,
+                    read:    false,
+                    target:  'staff',
+                    createdAt: new Date(),
+                  });
+                }
+              } catch (waErr) { logger.error(`[WHATSAPP REMINDER] ${waErr.message}`); }
             }
             // ──────────────────────────────────────────────────────────────────
 
@@ -4723,6 +4732,13 @@ ${urlEntries}
       }, 4*60*1000);
       logger.info('Keep-alive ping scheduled every 4 minutes');
     }
+
+    // ── WhatsApp (Baileys) — booking confirmations + reminders ─────────────
+    // No-ops unless WHATSAPP_ENABLED=true (see lib/whatsapp.js). First run
+    // prints a QR code to the console to link the salon's WhatsApp number;
+    // the session then persists in baileys_auth/ across restarts.
+    initWhatsApp();
+    // ─────────────────────────────────────────────────────────────────────
 
     app.listen(port, () => { console.log(`Server is running on port: ${port}`); });
 
