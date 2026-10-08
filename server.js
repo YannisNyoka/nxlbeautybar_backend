@@ -150,7 +150,7 @@ async function startServer() {
               const resend = new Resend(process.env.RESEND_API_KEY);
               const frontendUrl = (process.env.CORS_ORIGIN || 'https://nxlbeautybar.co.za').replace(/\/$/, '');
               await resend.emails.send({
-                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                 to:      user.email,
                 subject: `Welcome to NXL Beauty Bar, ${user.firstName}! 💅`,
                 html: `
@@ -354,7 +354,7 @@ async function startServer() {
             try {
               const resend = new Resend(process.env.RESEND_API_KEY);
               const { error } = await resend.emails.send({
-                from: 'NXL Beauty Bar <onboarding@resend.dev>',
+                from: 'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                 to: user.email,
                 subject: 'Reset Your NXL Beauty Bar Password',
                 html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;"><h2 style="font-family:Georgia,serif;color:#3d1f15;">NXL Beauty Bar</h2><h3 style="color:#6b3528;">Password Reset Request</h3><p style="color:#555;line-height:1.65;">Hi ${user.firstName},<br/><br/>We received a request to reset your password. Click the button below to choose a new password. This link expires in <strong>1 hour</strong>.</p><div style="text-align:center;margin:2rem 0;"><a href="${resetUrl}" style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.85rem 2rem;border-radius:50px;font-weight:700;font-size:0.95rem;display:inline-block;">Reset My Password</a></div><p style="color:#9e7060;font-size:0.82rem;">If the button doesn't work, copy this link:<br/><a href="${resetUrl}" style="color:#a0502e;word-break:break-all;">${resetUrl}</a></p><p style="color:#b08070;font-size:0.78rem;">If you didn't request this, you can safely ignore this email.</p><hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/><p style="color:#b08070;font-size:0.7rem;text-align:center;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p></div>`,
@@ -640,7 +640,7 @@ async function startServer() {
                     const resend = new Resend(process.env.RESEND_API_KEY);
                     const formattedDate = new Date(req.body.date + 'T00:00:00').toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
                     await resend.emails.send({
-                      from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                      from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                       to:      clientUser.email,
                       subject: `Booking Confirmed — ${svcNames} on ${formattedDate}`,
                       html: `
@@ -853,7 +853,7 @@ async function startServer() {
                 const depositAmount = Number(process.env.DEPOSIT_AMOUNT || 100);
                 const wasPaid = apptDoc.paymentStatus !== 'unpaid';
                 await resend.emails.send({
-                  from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                  from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                   to:      clientUser.email,
                   subject: `Appointment Cancelled — ${svcNames} on ${formattedDate}`,
                   html: `
@@ -1943,7 +1943,7 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
             const resend  = new Resend(process.env.RESEND_API_KEY);
             const buyer   = await db.collection('USERS').findOne({ _id: card.purchasedBy }, { projection: { firstName:1 } });
             await resend.emails.send({
-              from:    'NXL Beauty Bar <onboarding@resend.dev>',
+              from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
               to:      card.recipientEmail,
               subject: `🎁 You've received an NXL Beauty Bar Gift Card — R${card.amount}`,
               html: `
@@ -2509,7 +2509,7 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
                 `<tr><td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;font-weight:600;color:#3d1f15;">${p.name}</td><td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;text-align:center;font-weight:800;color:${p.stock===0?'#dc2626':'#c05621'};font-size:1rem;">${p.stock}</td><td style="padding:0.5rem 0.75rem;border-bottom:1px solid #e0ccc4;color:#9e7060;font-size:0.82rem;">${p.stock===0?'🔴 Out of stock':'🟡 Low stock'}</td></tr>`
               ).join('');
               await resend.emails.send({
-                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                 to:      process.env.ADMIN_EMAIL,
                 subject: `⚠️ Low Stock Alert — ${lowStockProducts.length} product${lowStockProducts.length>1?'s need':' needs'} restocking`,
                 html:`<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;"><h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2><h3 style="color:#c05621;margin-top:0;">⚠️ Low Stock Alert</h3><p style="color:#555;line-height:1.65;">The following product${lowStockProducts.length>1?'s are':' is'} running low after a recent sale:</p><table style="width:100%;border-collapse:collapse;margin:1.25rem 0;background:#fff;border-radius:10px;overflow:hidden;"><thead><tr style="background:#f9f1ec;"><th style="padding:0.6rem 0.75rem;text-align:left;font-size:0.72rem;color:#9e7060;text-transform:uppercase;">Product</th><th style="padding:0.6rem 0.75rem;text-align:center;font-size:0.72rem;color:#9e7060;text-transform:uppercase;">Stock Left</th><th style="padding:0.6rem 0.75rem;text-align:left;font-size:0.72rem;color:#9e7060;text-transform:uppercase;">Status</th></tr></thead><tbody>${itemRows}</tbody></table><div style="text-align:center;margin:1.5rem 0;"><a href="${(process.env.CORS_ORIGIN||'https://nxlbeautybar.co.za').replace(/\/$/,'')}/admin-dashboard" style="background:#3d1f15;color:#ffe8d6;text-decoration:none;padding:0.75rem 2rem;border-radius:50px;font-weight:700;font-size:0.88rem;display:inline-block;">Go to Admin Dashboard →</a></div></div>`,
@@ -2525,7 +2525,7 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
             const user = await db.collection('USERS').findOne({ _id:order.userId });
             const itemsList = (order.items||[]).map(i => `<tr><td style="padding:6px 0">${i.productName}</td><td style="padding:6px 0;text-align:right">x${i.quantity}</td><td style="padding:6px 0;text-align:right">R${parseFloat(i.lineTotal?.toString()||0).toFixed(2)}</td></tr>`).join('');
             await resend.emails.send({
-              from:'NXL Beauty Bar <onboarding@resend.dev>',
+              from:'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
               to:user?.email || order.shippingAddress?.email,
               subject:`Order Confirmed — NXL Beauty Bar #${orderId.slice(-6).toUpperCase()}`,
               html:`<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;"><h2 style="color:#3d1f15;font-family:Georgia,serif;">NXL Beauty Bar</h2><h3 style="color:#6b3528;">Order Confirmed! 🎉</h3><p>Hi ${user?.firstName||order.shippingAddress?.fullName},</p><p>Thank you for your order!</p><table style="width:100%;border-collapse:collapse;margin:1rem 0;"><thead><tr style="border-bottom:2px solid #e0ccc4;"><th style="text-align:left;padding:6px 0">Item</th><th style="text-align:right;padding:6px 0">Qty</th><th style="text-align:right;padding:6px 0">Total</th></tr></thead><tbody>${itemsList}</tbody><tfoot><tr style="border-top:1px solid #e0ccc4;"><td colspan="2" style="padding:6px 0">Shipping</td><td style="text-align:right;padding:6px 0">R${parseFloat(order.shippingFee?.toString()||0).toFixed(2)}</td></tr><tr><td colspan="2" style="padding:6px 0;font-weight:700">Total Paid</td><td style="text-align:right;padding:6px 0;font-weight:700">R${parseFloat(order.totalAmount?.toString()||0).toFixed(2)}</td></tr></tfoot></table><p style="color:#9e7060;font-size:0.78rem;">Order ref: #${orderId.slice(-6).toUpperCase()}</p><hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/><p style="color:#b08070;font-size:0.7rem;text-align:center;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p></div>`,
@@ -2659,7 +2659,7 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
 
             if (toEmail) {
               await resend.emails.send({
-                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                 to:      toEmail,
                 subject: isPickupOrder
                   ? `Your Order #${shortId} is Ready to Collect! 🏪`
@@ -2791,7 +2791,7 @@ app.post('/appointments/check-availability', authenticateToken, async (req, res)
               ).join('');
 
               await resend.emails.send({
-                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                 to:      process.env.ADMIN_EMAIL,
                 subject: `⚠️ Low Stock Alert — ${lowStockProducts.length} product${lowStockProducts.length > 1 ? 's need' : ' needs'} restocking`,
                 html: `
@@ -3359,7 +3359,7 @@ ${urlEntries}
             const user   = await db.collection('USERS').findOne({ _id: sub.userId }, { projection:{ email:1, firstName:1 } });
             if (user?.email) {
               await resend.emails.send({
-                from:    'NXL Beauty Bar <onboarding@resend.dev>',
+                from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
                 to:      user.email,
                 subject: `Your ${sub.planName} Subscription is Active! 💅`,
                 html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
@@ -4246,7 +4246,7 @@ ${urlEntries}
           if (process.env.RESEND_API_KEY) {
             try {
               const resend = new Resend(process.env.RESEND_API_KEY);
-              await resend.emails.send({ from:'NXL Beauty Bar <onboarding@resend.dev>', to: email, subject:`Booking Request — NXL Beauty Bar`, html:`<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;"><h2 style="color:#3d1f15;font-family:Georgia,serif;">NXL Beauty Bar</h2><h3 style="color:#6b3528;">Booking Received! 📅</h3><p>Hi ${sanitiseText(firstName, 50)},</p><p>Your booking request for <strong>${date}</strong> at <strong>${time}</strong> has been received.</p><p>Services: <strong>${svcs.map(s => s.name).join(', ')}</strong></p><p style="color:#9e7060;font-size:0.82rem;">We'll confirm shortly. A deposit of R${depositAmount} is required.</p></div>` });
+              await resend.emails.send({ from:'NXL Beauty Bar <noreply@nxlbeautybar.co.za>', to: email, subject:`Booking Request — NXL Beauty Bar`, html:`<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;"><h2 style="color:#3d1f15;font-family:Georgia,serif;">NXL Beauty Bar</h2><h3 style="color:#6b3528;">Booking Received! 📅</h3><p>Hi ${sanitiseText(firstName, 50)},</p><p>Your booking request for <strong>${date}</strong> at <strong>${time}</strong> has been received.</p><p>Services: <strong>${svcs.map(s => s.name).join(', ')}</strong></p><p style="color:#9e7060;font-size:0.82rem;">We'll confirm shortly. A deposit of R${depositAmount} is required.</p></div>` });
             } catch (em) { logger.error(`[GUEST BOOKING EMAIL] ${em.message}`); }
           }
           await db.collection('NOTIFICATIONS').insertOne({ message: `New booking from ${firstName} ${lastName} — ${date} at ${time}`, target: 'staff', read: false, createdAt: new Date() });
@@ -4470,7 +4470,7 @@ ${urlEntries}
             const formattedDate = new Date(appt.date + 'T00:00:00').toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
 
             await resend.emails.send({
-              from:    'NXL Beauty Bar <onboarding@resend.dev>',
+              from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
               to:      clientUser.email,
               subject: `Reminder: Your appointment is tomorrow at ${appt.time} 💅`,
               html: `
@@ -4628,7 +4628,7 @@ ${urlEntries}
             const bookingLink = `${frontendUrl}/dashboard`;
 
             const response = await resend.emails.send({
-              from:    'NXL Beauty Bar <onboarding@resend.dev>',
+              from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
               to:      clientUser.email,
               subject: `✨ It's time for your ${svcNames} — book now!`,
               html: `
