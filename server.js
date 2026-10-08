@@ -13,6 +13,8 @@ const swaggerUi = require('swagger-ui-express');
 const winston = require('winston');
 const { Resend } = require('resend');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const fetchFn = require('./lib/fetchPolyfill');
 
@@ -4034,6 +4036,22 @@ ${urlEntries}
     );
     // ══════════════════════════════════════════════════════════════════════
 
+    // ── GET /whatsapp-qr — view the pending WhatsApp link QR in a browser ──
+    // On a host with no direct filesystem access (e.g. Render), this is how
+    // you scan it: open this URL with the secret once, during the ~60s a QR
+    // is valid. Gated by WHATSAPP_QR_SECRET so a stranger can't find this
+    // URL and hijack the link. Returns 404 once already connected, or if no
+    // QR has been generated yet.
+    app.get('/whatsapp-qr', (req, res) => {
+      if (!process.env.WHATSAPP_QR_SECRET || req.query.secret !== process.env.WHATSAPP_QR_SECRET) {
+        return res.status(404).send('Not found');
+      }
+      const qrPath = path.join(__dirname, 'whatsapp-qr.png');
+      if (!fs.existsSync(qrPath)) return res.status(404).send('No QR pending — either already linked, or the server hasn\'t generated one yet (give it a few seconds after startup).');
+      res.sendFile(qrPath);
+    });
+    // ──────────────────────────────────────────────────────────────────────
+
     // ══════════════════════════════════════════════════════════════════════
     // STAFF SCHEDULE ROUTES
     // ══════════════════════════════════════════════════════════════════════
@@ -4737,7 +4755,7 @@ ${urlEntries}
     // No-ops unless WHATSAPP_ENABLED=true (see lib/whatsapp.js). First run
     // prints a QR code to the console to link the salon's WhatsApp number;
     // the session then persists in baileys_auth/ across restarts.
-    initWhatsApp();
+    initWhatsApp(db);
     // ─────────────────────────────────────────────────────────────────────
 
     app.listen(port, () => { console.log(`Server is running on port: ${port}`); });
