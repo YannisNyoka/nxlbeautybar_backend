@@ -4469,7 +4469,7 @@ ${urlEntries}
             const totalDuration = services.reduce((sum, s) => sum + (s.durationMinutes || 0), 0);
             const formattedDate = new Date(appt.date + 'T00:00:00').toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
 
-            await resend.emails.send({
+            const emailResponse = await resend.emails.send({
               from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
               to:      clientUser.email,
               subject: `Reminder: Your appointment is tomorrow at ${appt.time} 💅`,
@@ -4518,6 +4518,8 @@ ${urlEntries}
                 </div>
               `,
             });
+
+            if (emailResponse.error) throw new Error(emailResponse.error.message);
 
             // Mark reminder as sent so it doesn't fire again
             await db.collection('APPOINTMENTS').updateOne(
