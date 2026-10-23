@@ -632,68 +632,7 @@ async function startServer() {
               await db.collection('NOTIFICATIONS').insertOne({ message:`📅 New booking: ${req.body.userName || 'A client'} — ${svcNames} on ${req.body.date} at ${req.body.time}`, target:'staff', recipientId:null, createdBy:new ObjectId(req.user.userId), createdAt:new Date(), read:false, readAt:null });
               logger.info('Booking notification created', { appointmentId:result.insertedId, userName:req.body.userName, date:req.body.date, time:req.body.time });
 
-              // ── Booking confirmation email ────────────────────────────────
-              if (process.env.RESEND_API_KEY) {
-                try {
-                  const clientUser = await db.collection('USERS').findOne({ _id: req.body.userId }, { projection: { email:1, firstName:1, lastName:1 } });
-                  if (clientUser?.email) {
-                    const resend = new Resend(process.env.RESEND_API_KEY);
-                    const formattedDate = new Date(req.body.date + 'T00:00:00').toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
-                    await resend.emails.send({
-                      from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
-                      to:      clientUser.email,
-                      subject: `Booking Confirmed — ${svcNames} on ${formattedDate}`,
-                      html: `
-                        <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
-                          <h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2>
-                          <h3 style="color:#6b3528;margin-top:0;">Booking Confirmed! 💅</h3>
-                          <p style="color:#555;line-height:1.65;">Hi ${clientUser.firstName},</p>
-                          <p style="color:#555;line-height:1.65;">Your appointment has been booked. Here are your details:</p>
-                          <table style="width:100%;border-collapse:collapse;margin:1.25rem 0;background:#fff;border-radius:10px;overflow:hidden;">
-                            <tr style="border-bottom:1px solid #e0ccc4;">
-                              <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;width:40%;">Service</td>
-                              <td style="padding:0.75rem 1rem;color:#555;">${svcNames}</td>
-                            </tr>
-                            <tr style="border-bottom:1px solid #e0ccc4;">
-                              <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;">Date</td>
-                              <td style="padding:0.75rem 1rem;color:#555;">${formattedDate}</td>
-                            </tr>
-                            <tr style="border-bottom:1px solid #e0ccc4;">
-                              <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;">Time</td>
-                              <td style="padding:0.75rem 1rem;color:#555;">${req.body.time}</td>
-                            </tr>
-                            <tr>
-                              <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;">Deposit Paid</td>
-                              <td style="padding:0.75rem 1rem;color:#276749;font-weight:700;">✓ R${Number(process.env.DEPOSIT_AMOUNT||100).toFixed(2)}</td>
-                            </tr>
-                          </table>
-                          <div style="background:#fff8f3;border:1px solid #e0ccc4;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem;">
-                            <p style="margin:0;font-size:0.85rem;color:#6b3528;font-weight:700;">📍 Where to find us</p>
-                            <p style="margin:0.35rem 0 0;font-size:0.82rem;color:#9e7060;">1948 Mahalefele Rd, Dube, Soweto, 1800</p>
-                            <p style="margin:0.25rem 0 0;font-size:0.82rem;color:#9e7060;">📞 068 511 3394 &nbsp;|&nbsp; 🕐 Mon–Sat 9AM–5PM</p>
-                          </div>
-                          <div style="background:#fff3f3;border:1px solid #fca5a5;border-radius:10px;padding:0.875rem 1.25rem;margin-bottom:1.25rem;">
-                            <p style="margin:0;font-size:0.82rem;color:#c53030;font-weight:600;">⚠️ Please note</p>
-                            <ul style="margin:0.4rem 0 0;padding-left:1.25rem;font-size:0.8rem;color:#9e7060;line-height:1.75;">
-                              <li>R50 late fee applies per 15 minutes after your scheduled time</li>
-                              <li>Arriving 30+ minutes late will result in appointment cancellation</li>
-                              <li>48 hours notice required for cancellations</li>
-                              <li>Your R${Number(process.env.DEPOSIT_AMOUNT||100).toFixed(2)} deposit is non-refundable</li>
-                            </ul>
-                          </div>
-                          <p style="color:#9e7060;font-size:0.8rem;line-height:1.65;">Need to reschedule or have questions? WhatsApp us at <a href="https://wa.me/27685113394" style="color:#a0502e;">068 511 3394</a>.</p>
-                          <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
-                          <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p>
-                        </div>
-                      `,
-                    });
-                    logger.info(`[BOOKING EMAIL] Confirmation sent to ${clientUser.email}`, { appointmentId: result.insertedId });
-                  }
-                } catch (emailErr) {
-                  logger.error(`[BOOKING EMAIL] Failed to send confirmation: ${emailErr.message}`);
-                }
-              }
-              // ─────────────────────────────────────────────────────────────
+              // Booking confirmation email is sent only once payment is confirmed (see sendBookingConfirmationEmail).
 
             } catch (notifErr) { logger.warn('Failed to create booking notification:', { error:notifErr.message }); }
           }
@@ -1174,9 +1113,84 @@ async function startServer() {
     // POST /payments handler that was dead code — shadowed by the earlier
     // POST /payments route used to create the Yoco checkout — so none of it
     // ever actually ran for a real paid booking.)
+    // ── Booking confirmation email — sent ONLY once payment is confirmed ─────
+    // Atomically claims the send (confirmationEmailSent) so the webhook, /payments/verify
+    // and admin manual payments can never send it twice.
+    async function sendBookingConfirmationEmail(apptId) {
+      if (!process.env.RESEND_API_KEY) return;
+      try {
+        const appt = await db.collection('APPOINTMENTS').findOneAndUpdate(
+          { _id: new ObjectId(apptId), paymentStatus: { $in: ['deposit_paid', 'paid'] }, confirmationEmailSent: { $ne: true } },
+          { $set: { confirmationEmailSent: true, confirmationEmailSentAt: new Date() } },
+          { returnDocument: 'before' }
+        );
+        if (!appt) return; // unpaid, already sent, or not found
+        const bookedServices = await db.collection('SERVICES').find({ _id:{ $in:appt.serviceIds||[] } }).project({ name:1 }).toArray();
+        const svcNames = bookedServices.map(s => s.name).join(', ');
+        const clientUser = await db.collection('USERS').findOne({ _id: appt.userId }, { projection: { email:1, firstName:1, lastName:1 } });
+        if (clientUser?.email) {
+          const resend = new Resend(process.env.RESEND_API_KEY);
+          const formattedDate = new Date(appt.date + 'T00:00:00').toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
+          await resend.emails.send({
+            from:    'NXL Beauty Bar <noreply@nxlbeautybar.co.za>',
+            to:      clientUser.email,
+            subject: `Booking Confirmed — ${svcNames} on ${formattedDate}`,
+            html: `
+              <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:2rem;background:#fdf6f0;border-radius:12px;">
+                <h2 style="font-family:Georgia,serif;color:#3d1f15;margin-bottom:0.25rem;">NXL Beauty Bar</h2>
+                <h3 style="color:#6b3528;margin-top:0;">Booking Confirmed! 💅</h3>
+                <p style="color:#555;line-height:1.65;">Hi ${clientUser.firstName},</p>
+                <p style="color:#555;line-height:1.65;">Your appointment has been booked. Here are your details:</p>
+                <table style="width:100%;border-collapse:collapse;margin:1.25rem 0;background:#fff;border-radius:10px;overflow:hidden;">
+                  <tr style="border-bottom:1px solid #e0ccc4;">
+                    <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;width:40%;">Service</td>
+                    <td style="padding:0.75rem 1rem;color:#555;">${svcNames}</td>
+                  </tr>
+                  <tr style="border-bottom:1px solid #e0ccc4;">
+                    <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;">Date</td>
+                    <td style="padding:0.75rem 1rem;color:#555;">${formattedDate}</td>
+                  </tr>
+                  <tr style="border-bottom:1px solid #e0ccc4;">
+                    <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;">Time</td>
+                    <td style="padding:0.75rem 1rem;color:#555;">${appt.time}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:0.75rem 1rem;font-weight:700;color:#3d1f15;">Deposit Paid</td>
+                    <td style="padding:0.75rem 1rem;color:#276749;font-weight:700;">✓ R${Number(process.env.DEPOSIT_AMOUNT||100).toFixed(2)}</td>
+                  </tr>
+                </table>
+                <div style="background:#fff8f3;border:1px solid #e0ccc4;border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem;">
+                  <p style="margin:0;font-size:0.85rem;color:#6b3528;font-weight:700;">📍 Where to find us</p>
+                  <p style="margin:0.35rem 0 0;font-size:0.82rem;color:#9e7060;">1948 Mahalefele Rd, Dube, Soweto, 1800</p>
+                  <p style="margin:0.25rem 0 0;font-size:0.82rem;color:#9e7060;">📞 068 511 3394 &nbsp;|&nbsp; 🕐 Mon–Sat 9AM–5PM</p>
+                </div>
+                <div style="background:#fff3f3;border:1px solid #fca5a5;border-radius:10px;padding:0.875rem 1.25rem;margin-bottom:1.25rem;">
+                  <p style="margin:0;font-size:0.82rem;color:#c53030;font-weight:600;">⚠️ Please note</p>
+                  <ul style="margin:0.4rem 0 0;padding-left:1.25rem;font-size:0.8rem;color:#9e7060;line-height:1.75;">
+                    <li>R50 late fee applies per 15 minutes after your scheduled time</li>
+                    <li>Arriving 30+ minutes late will result in appointment cancellation</li>
+                    <li>48 hours notice required for cancellations</li>
+                    <li>Your R${Number(process.env.DEPOSIT_AMOUNT||100).toFixed(2)} deposit is non-refundable</li>
+                  </ul>
+                </div>
+                <p style="color:#9e7060;font-size:0.8rem;line-height:1.65;">Need to reschedule or have questions? WhatsApp us at <a href="https://wa.me/27685113394" style="color:#a0502e;">068 511 3394</a>.</p>
+                <hr style="border:none;border-top:1px solid #e0ccc4;margin:1.5rem 0;"/>
+                <p style="color:#b08070;font-size:0.7rem;text-align:center;margin:0;">NXL Beauty Bar &middot; 1948 Mahalefele Rd, Dube, Soweto, 1800</p>
+              </div>
+            `,
+          });
+          logger.info(`[BOOKING EMAIL] Confirmation sent to ${clientUser.email}`, { appointmentId: String(apptId) });
+        }
+      } catch (emailErr) {
+        logger.error(`[BOOKING EMAIL] Failed to send confirmation: ${emailErr.message}`);
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+
     async function handleBookingPaymentConfirmed(appointmentId, amountPaid) {
       const appt = await db.collection('APPOINTMENTS').findOne({ _id: appointmentId });
       if (!appt?.userId) return;
+      await sendBookingConfirmationEmail(appointmentId);
 
       try {
         const client = await db.collection('USERS').findOne({ _id: appt.userId });
